@@ -23,10 +23,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact: skycraft-client-macos-arm64
             binary: skycraft-client
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: skycraft-client-macos-x86_64
-            binary: skycraft-client
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.artifact }}
