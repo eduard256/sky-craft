@@ -1,6 +1,27 @@
+# Auth service
 .env
 __pycache__/
 *.pyc
 *.db
-data/
+auth/data/
 .venv/
+
+# Assets (downloaded at build time, not stored in git)
+client/assets/textures/
+client/assets/sounds/*.ogg
+client/assets/sounds/blocks/
+client/assets/sounds/mobs/
+client/assets/sounds/environment/
+client/assets/sounds/items/
+client/assets/sounds/combat/
+client/assets/sounds/player/
+client/assets/sounds/music/
+client/assets/models/
+.asset_cache/
+
+# Build artifacts
+target/
+*.exe
+*.dll
+*.so
+*.dylib
