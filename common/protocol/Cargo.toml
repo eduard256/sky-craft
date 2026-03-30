@@ -1,0 +1,10 @@
+[package]
+name = "skycraft-protocol"
+version = "0.0.1"
+edition = "2024"
+description = "Shared protocol types for Sky Craft client-server communication"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
