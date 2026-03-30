@@ -1,74 +1,50 @@
 # TODO: Input & Camera Control
 
-## Status: Partial (key/mouse tracking exists, no camera or action dispatch)
+## Status: Basic camera and input DONE, advanced features remaining
 
-## What exists
-- `input.rs`: InputState tracks keys, mouse, scroll, convenience methods
-- No camera struct, no mouse capture, no input -> packet conversion
+## What is DONE
+- [x] InputState: keyboard + mouse tracking, per-frame pressed/clicked
+- [x] Convenience methods: WASD, jump, sneak, sprint, hotbar keys, inventory, chat, F3
+- [x] Camera struct: position, yaw, pitch, FOV, aspect, near/far
+- [x] Mouse look: yaw/pitch from mouse delta with sensitivity
+- [x] Camera movement: WASD + Space/Shift, sprint with Ctrl
+- [x] View-projection matrix generation (glam)
+- [x] Camera wired to input in state.rs update loop
 
-## What needs to be built
+## What still needs to be built
 
 ### Mouse capture
-- On entering Playing state: capture mouse (hide cursor, lock to center)
-- ESC: release mouse (pause menu)
-- Click in window when not captured: re-capture
+- Capture mouse on entering Playing state (hide cursor, lock to center)
+- ESC: release mouse (show pause menu)
+- Click to re-capture when window focused
 - winit CursorGrabMode::Confined or Locked
-- Raw mouse input for look (DeviceEvent::MouseMotion preferred)
+- Raw mouse input (DeviceEvent::MouseMotion) for smoother look
 
-### Camera control
-- Yaw: mouse X movement * sensitivity
-- Pitch: mouse Y movement * sensitivity, clamped -89..+89 degrees
-- Sensitivity setting: configurable in settings (default 0.15 deg/pixel)
-- Invert Y option
-
-### Player movement input -> packets
-- Every tick (50ms): if position/look changed, send to server
-- Build C2SPlayerPositionAndLook from current input state
-- Movement prediction: move locally, server corrects if wrong
-  - Apply WASD input to velocity based on look direction
-  - Apply gravity, collision with local chunk data
-  - Show predicted position immediately, correct on server response
+### Player movement -> packets
+- Send C2SPlayerPositionAndLook to server every tick when moving
+- Client-side prediction: apply movement locally, server corrects
+- Gravity + collision with local chunk data
 - Sprint: double-tap W or hold Ctrl
-- Sneak: hold Shift, prevent fall off edges
+- Sneak: hold Shift, prevent fall off block edges
 
 ### Action input -> packets
-- Left click: C2SBlockDig (start/finish digging) or C2SEntityInteract (attack)
-  - Raycast from camera to determine what's being looked at
-  - If block: start digging animation, send Start, track progress, send Finish
-  - If entity: send Attack
-- Right click: C2SBlockPlace or C2SUseItem
-  - If looking at block: place block on face
-  - If holding usable item (food, bow): use item
-- Scroll wheel: change held hotbar slot
-- Q: drop item
-- E: toggle inventory screen
-- T: open chat
-- F3: toggle debug screen
-- 1-9: select hotbar slot
+- Left click: raycast -> C2SBlockDig or C2SEntityInteract
+- Right click: raycast -> C2SBlockPlace or C2SUseItem
+- Scroll wheel: change hotbar slot (C2SHeldItemChange)
+- Q: drop item, E: inventory, T: chat, F3: debug
 
 ### Block targeting (raycast)
-- Cast ray from camera position in look direction
-- Step through blocks (DDA algorithm or similar)
-- Max range: 5 blocks (survival), 5 blocks (creative can be extended)
-- Return: hit block position + face hit + distance
-- Highlight targeted block: render wireframe outline around it
-- Show block face indicator (which face will be placed against)
+- DDA ray-march from camera through voxel grid
+- Max range: 5 blocks
+- Return: block position + hit face + distance
+- Render wireframe outline on targeted block
 
 ### Block breaking animation
-- On start digging: show crack overlay on targeted block face
-- 10 stages of cracking texture (from MC textures)
-- Progress rate depends on tool + block hardness (from server or local calc)
-- Cancel if target changes or mouse released
+- Crack overlay texture (10 stages) on targeted block face
+- Progress based on tool + block hardness
+- Cancel on target change or mouse release
 
-### Hotbar scrolling
-- Mouse scroll: change held slot (wrap 0-8)
-- Number keys 1-9: direct slot selection
-- Send C2SHeldItemChange to server on change
+### Files to create
+- `client/src/renderer/outline.rs` -- block selection wireframe
 
-### Files to create/modify
-- `client/src/input.rs`: add mouse capture, sensitivity, action dispatch
-- `client/src/renderer/camera.rs`: camera struct, view/proj matrices, raycast
-- `client/src/state.rs`: wire input to network packet sending
-- `client/src/renderer/outline.rs`: block selection wireframe
-
-### Estimated: ~1500 lines
+### Estimated remaining: ~800 lines
