@@ -1,6 +1,46 @@
 [package]
 name = "skycraft-server"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "Sky Craft game server - authoritative game logic"
 
 [dependencies]
+skycraft-protocol = { path = "../common/protocol" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# QUIC transport
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Noise for world generation
+noise = "0.9"
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client for auth API
+reqwest = { version = "0.12", features = ["json"] }
+
+# Config
+toml = "0.8"
+
+# Random
+rand = "0.9"
+
+# Time
+tokio-util = { version = "0.7", features = ["time"] }
+
+# Dashmap for concurrent collections
+dashmap = "6"
