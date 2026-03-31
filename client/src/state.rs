@@ -12,6 +12,7 @@ use crate::input::InputState;
 use crate::world::ClientWorld;
 use crate::session;
 use crate::auth_client;
+use crate::net_bridge::NetBridge;
 
 /// Application state machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +64,9 @@ pub struct App {
     egui_renderer: Option<egui_wgpu::Renderer>,
 
     ui: UiState,
+
+    /// Network bridge (alive while connected to server).
+    net: Option<NetBridge>,
 }
 
 impl App {
@@ -83,6 +87,7 @@ impl App {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             egui_renderer: None,
+            net: None,
             ui: UiState {
                 screen: AppScreen::MainMenu,
                 server_address: "127.0.0.1".to_string(),
@@ -188,6 +193,13 @@ impl App {
         let Some(egui_state) = &mut self.egui_state else { return };
         let Some(renderer) = &mut self.renderer else { return };
         let Some(egui_renderer) = &mut self.egui_renderer else { return };
+
+        // Drain network packets into world (if connected)
+        if let Some(ref net) = self.net {
+            for packet in net.drain_packets() {
+                self.world.handle_server_packet(packet);
+            }
+        }
 
         // Begin egui frame
         let raw_input = egui_state.take_egui_input(window);
@@ -337,15 +349,15 @@ impl App {
 
         self.ui.status_message = format!("Connecting to {}...", addr);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut net_client = crate::network::NetworkClient::new();
-
-        match rt.block_on(net_client.connect(&addr, &token)) {
-            Ok(login_success) => {
+        match NetBridge::connect(addr, token) {
+            Ok((bridge, login_success)) => {
                 info!("Connected! Player: {} UUID: {}", login_success.nickname, login_success.player_uuid);
                 self.ui.nickname = login_success.nickname;
                 self.ui.status_message.clear();
                 self.ui.screen = AppScreen::Playing;
+
+                // Store the bridge -- keeps connection alive, packets flow in background
+                self.net = Some(bridge);
             }
             Err(e) => {
                 let err_msg = e.to_string();
