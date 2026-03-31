@@ -15,6 +15,7 @@ pub mod atlas;
 pub mod mesh;
 pub mod camera;
 pub mod hand;
+pub mod pipeline;
 
 use tracing::info;
 use winit::event_loop::EventLoop;
