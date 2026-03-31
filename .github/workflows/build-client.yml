@@ -52,8 +52,9 @@ jobs:
           BINARY: ${{ matrix.binary }}
           ARTIFACT: ${{ matrix.artifact }}
         run: |
-          mkdir -p dist
+          mkdir -p dist/data
           cp "target/${TARGET}/release/${BINARY}" dist/
+          cp common/data/block_textures.json dist/data/
           cd dist && tar czf "../${ARTIFACT}.tar.gz" *
 
       - name: Package (Windows)
@@ -65,7 +66,9 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
           mkdir dist
+          mkdir dist\data
           copy "target\${env:TARGET}\release\${env:BINARY}" dist\
+          copy common\data\block_textures.json dist\data\
           Compress-Archive -Path dist\* -DestinationPath "${env:ARTIFACT}.zip"
 
       - name: Upload artifact

@@ -107,6 +107,9 @@ pub struct App {
     /// Chunks that have been meshed (to avoid re-meshing).
     meshed_chunks: HashSet<ChunkPos>,
 
+    /// Set to true if init_game_rendering failed so we don't spam retries every frame.
+    rendering_init_failed: bool,
+
     /// Receiver end of the asset download progress channel.
     /// None when no download is in progress (or already done).
     download_rx: Option<mpsc::Receiver<DownloadProgress>>,
@@ -163,6 +166,7 @@ impl App {
             camera: Camera::new(8),
             hand: Hand::new(),
             meshed_chunks: HashSet::new(),
+            rendering_init_failed: false,
             download_rx,
             download_ui,
             last_frame_time: std::time::Instant::now(),
@@ -182,6 +186,7 @@ impl App {
     fn init_game_rendering(&mut self) {
         let Some(renderer) = &self.renderer else { return };
         if self.atlas.is_some() { return; } // already initialized
+        if self.rendering_init_failed { return; } // don't retry after a fatal error
 
         // Resolve asset paths. In dev mode (cargo run from repo root) these point into
         // client/assets/textures; in release builds they point next to the exe.
@@ -208,6 +213,7 @@ impl App {
             Ok(a) => a,
             Err(e) => {
                 warn!("Failed to build atlas: {}", e);
+                self.rendering_init_failed = true;
                 return;
             }
         };
@@ -225,6 +231,7 @@ impl App {
             Ok(p) => p,
             Err(e) => {
                 warn!("Failed to create pipeline: {}", e);
+                self.rendering_init_failed = true;
                 return;
             }
         };
@@ -723,6 +730,7 @@ impl App {
                 self.meshed_chunks.clear();
                 self.atlas = None;
                 self.game_pipeline = None;
+                self.rendering_init_failed = false;
             }
             Err(e) => {
                 let err_msg = e.to_string();
