@@ -20,7 +20,21 @@ pub mod blocks {
     pub const COBBLESTONE: BlockStateId = 14;
     pub const OAK_PLANKS: BlockStateId = 15;
     pub const OAK_LOG: BlockStateId = 126;
+    pub const SPRUCE_LOG: BlockStateId = 129;
+    pub const BIRCH_LOG: BlockStateId = 132;
+    pub const JUNGLE_LOG: BlockStateId = 135;
+    pub const ACACIA_LOG: BlockStateId = 138;
+    pub const CHERRY_LOG: BlockStateId = 141;
+    pub const DARK_OAK_LOG: BlockStateId = 144;
+    pub const MANGROVE_LOG: BlockStateId = 147;
     pub const OAK_LEAVES: BlockStateId = 233;
+    pub const SPRUCE_LEAVES: BlockStateId = 261;
+    pub const BIRCH_LEAVES: BlockStateId = 289;
+    pub const JUNGLE_LEAVES: BlockStateId = 317;
+    pub const ACACIA_LEAVES: BlockStateId = 345;
+    pub const CHERRY_LEAVES: BlockStateId = 373;
+    pub const DARK_OAK_LEAVES: BlockStateId = 401;
+    pub const MANGROVE_LEAVES: BlockStateId = 429;
     pub const SAND: BlockStateId = 66;
     pub const GRAVEL: BlockStateId = 68;
     pub const COAL_ORE: BlockStateId = 36;
@@ -43,10 +57,6 @@ pub mod blocks {
     pub const SOUL_SAND: BlockStateId = 250;
     pub const OBSIDIAN: BlockStateId = 251;
     pub const SANDSTONE: BlockStateId = 67;
-    pub const BIRCH_LOG: BlockStateId = 78;
-    pub const BIRCH_LEAVES: BlockStateId = 148;
-    pub const SPRUCE_LOG: BlockStateId = 75;
-    pub const SPRUCE_LEAVES: BlockStateId = 146;
     pub const MOSSY_COBBLESTONE: BlockStateId = 253;
     pub const GOLD_BLOCK: BlockStateId = 255;
     pub const DIAMOND_BLOCK: BlockStateId = 256;
@@ -58,15 +68,18 @@ pub mod blocks {
     pub const BLUE_ICE: BlockStateId = 262;
 }
 
+type TreeBlocks = Vec<(i32, i32, i32, BlockStateId)>;
+
 /// World generator produces chunk sections from seed + position.
 pub struct WorldGenerator {
     seed: i64,
     pub flat: bool,
+    tree_cache: std::sync::Mutex<std::collections::HashMap<(i32, i32), Vec<TreeBlocks>>>,
 }
 
 impl WorldGenerator {
     pub fn new(seed: i64) -> Self {
-        Self { seed, flat: false }
+        Self { seed, flat: false, tree_cache: std::sync::Mutex::new(std::collections::HashMap::new()) }
     }
 
     /// Generate a chunk section at the given chunk position.
@@ -283,78 +296,209 @@ impl WorldGenerator {
     }
 
     /// Generate all trees for a chunk column (cx, cz). Returns world-space blocks.
-    fn flat_trees_in_column(&self, cx: i32, cz: i32) -> Vec<Vec<(i32, i32, i32, BlockStateId)>> {
-        let mut trees = Vec::new();
+    fn flat_trees_in_column(&self, cx: i32, cz: i32) -> Vec<TreeBlocks> {
+        // Check cache first
+        if let Ok(cache) = self.tree_cache.lock() {
+            if let Some(cached) = cache.get(&(cx, cz)) {
+                return cached.clone();
+            }
+        }
+
         let base_x = cx * 16;
         let base_z = cz * 16;
-
-        // Deterministic: how many trees in this column (0-2)
         let col_hash = block_hash(cx, 0, cz, self.seed);
-        let tree_count = (col_hash % 3) as i32; // 0, 1, or 2 trees
+        let tree_count = (col_hash % 3) as i32;
+        let mut trees = Vec::new();
 
         for i in 0..tree_count {
             let th = block_hash(cx, i, cz, self.seed.wrapping_add(1));
-
-            // Random position within column (avoid edges so logs are fully inside)
             let tx = base_x + 2 + (th % 12) as i32;
             let tz = base_z + 2 + ((th >> 8) % 12) as i32;
+            let tree_type = block_hash(tx, i as i32, tz, self.seed.wrapping_add(77)) % 8;
+            trees.push(self.gen_tree(tx, tz, th, tree_type));
+        }
 
-            // Random height 4-7
-            let height = 4 + ((th >> 16) % 4) as i32;
-            let top_y = 65 + height - 1; // trunk top world Y
-
-            let mut blocks_out: Vec<(i32, i32, i32, BlockStateId)> = Vec::new();
-
-            // Trunk with optional lean
-            let mut sx = tx;
-            let mut sz = tz;
-            for y in 65..(65 + height) {
-                blocks_out.push((sx, y, sz, blocks::OAK_LOG));
-                // Lean: every 3 blocks shift 1 in a random direction
-                if y % 3 == 0 {
-                    let lean_h = block_hash(sx, y, sz, self.seed.wrapping_add(2));
-                    match lean_h % 5 {
-                        0 => sx += 1,
-                        1 => sx -= 1,
-                        2 => sz += 1,
-                        3 => sz -= 1,
-                        _ => {} // straight
-                    }
-                }
+        // Store in cache, evict if too large (keep last 512 columns)
+        if let Ok(mut cache) = self.tree_cache.lock() {
+            if cache.len() > 512 {
+                cache.clear();
             }
-            let crown_x = sx;
-            let crown_z = sz;
-
-            // Crown: 5x5 two layers below top, 3x3 at top, 1x1 tip
-            for layer in 0..4i32 {
-                let cy = top_y - 1 + layer;
-                let radius: i32 = match layer {
-                    0 => 2, // 5x5
-                    1 => 2, // 5x5
-                    2 => 1, // 3x3
-                    _ => 0, // 1x1 tip
-                };
-                for dz in -radius..=radius {
-                    for dx in -radius..=radius {
-                        // Skip corners on 5x5 for rounder look
-                        if radius == 2 && dx.abs() == 2 && dz.abs() == 2 {
-                            // Randomly drop corners
-                            let corner_h = block_hash(crown_x + dx, cy, crown_z + dz, self.seed.wrapping_add(3));
-                            if corner_h % 2 == 0 { continue; }
-                        }
-                        // Don't overwrite trunk log
-                        let is_trunk = blocks_out.iter().any(|&(bx, by, bz, _)| bx == crown_x+dx && by == cy && bz == crown_z+dz);
-                        if !is_trunk {
-                            blocks_out.push((crown_x + dx, cy, crown_z + dz, blocks::OAK_LEAVES));
-                        }
-                    }
-                }
-            }
-
-            trees.push(blocks_out);
+            cache.insert((cx, cz), trees.clone());
         }
 
         trees
+    }
+
+    /// Generate a single tree at world pos (tx, 65, tz) by type.
+    fn gen_tree(&self, tx: i32, tz: i32, th: u64, tree_type: u64) -> Vec<(i32, i32, i32, BlockStateId)> {
+        let mut out: Vec<(i32, i32, i32, BlockStateId)> = Vec::new();
+        let base_y = 65i32;
+
+        let (log_id, leaf_id) = match tree_type {
+            0 => (blocks::OAK_LOG,      blocks::OAK_LEAVES),
+            1 => (blocks::SPRUCE_LOG,   blocks::SPRUCE_LEAVES),
+            2 => (blocks::BIRCH_LOG,    blocks::BIRCH_LEAVES),
+            3 => (blocks::JUNGLE_LOG,   blocks::JUNGLE_LEAVES),
+            4 => (blocks::ACACIA_LOG,   blocks::ACACIA_LEAVES),
+            5 => (blocks::CHERRY_LOG,   blocks::CHERRY_LEAVES),
+            6 => (blocks::DARK_OAK_LOG, blocks::DARK_OAK_LEAVES),
+            _ => (blocks::MANGROVE_LOG, blocks::MANGROVE_LEAVES),
+        };
+
+        match tree_type {
+            // ── Oak: tall straight, round crown 5x5→3x3→1
+            0 => {
+                let h = 6 + (th >> 16) as i32 % 3; // 6-8
+                for y in base_y..base_y + h {
+                    out.push((tx, y, tz, log_id));
+                }
+                gen_round_crown(&mut out, tx, tz, base_y + h, leaf_id, &[3, 3, 3, 2, 1, 0], self.seed);
+            }
+            // ── Spruce: tall narrow, layered cone crown
+            1 => {
+                let h = 8 + (th >> 16) as i32 % 4; // 8-11
+                for y in base_y..base_y + h {
+                    out.push((tx, y, tz, log_id));
+                }
+                let crown_bottom = base_y + 1;
+                let mut r = 4i32;
+                let mut y = crown_bottom;
+                while y <= base_y + h + 1 {
+                    for dz in -r..=r {
+                        for dx in -r..=r {
+                            if dx.abs() + dz.abs() <= r + 1 {
+                                if !(dx == 0 && dz == 0) {
+                                    out.push((tx + dx, y, tz + dz, leaf_id));
+                                }
+                            }
+                        }
+                    }
+                    y += 2;
+                    r = (r - 1).max(0);
+                }
+                out.push((tx, base_y + h + 1, tz, leaf_id));
+            }
+            // ── Birch: medium straight, tall narrow oval crown
+            2 => {
+                let h = 5 + (th >> 16) as i32 % 3; // 5-7
+                for y in base_y..base_y + h {
+                    out.push((tx, y, tz, log_id));
+                }
+                gen_round_crown(&mut out, tx, tz, base_y + h, leaf_id, &[2, 3, 2, 1, 0], self.seed);
+            }
+            // ── Jungle: very tall, bushy crown + leaf clusters on trunk
+            3 => {
+                let h = 10 + (th >> 16) as i32 % 5; // 10-14
+                for y in base_y..base_y + h {
+                    out.push((tx, y, tz, log_id));
+                }
+                gen_round_crown(&mut out, tx, tz, base_y + h, leaf_id, &[3, 3, 3, 2, 1, 0], self.seed);
+                // Leaf clusters on trunk at 1/3 and 2/3 height
+                for frac in &[3, 2] {
+                    let mid = base_y + h / frac;
+                    for &(dx, dz) in &[(1i32,0),(-1,0),(0,1i32),(0,-1),(2,0),(-2,0),(0,2),(0,-2)] {
+                        let lh = block_hash(tx+dx, mid, tz+dz, self.seed.wrapping_add(10));
+                        if lh % 3 != 0 {
+                            out.push((tx+dx, mid,   tz+dz, leaf_id));
+                            out.push((tx+dx, mid-1, tz+dz, leaf_id));
+                        }
+                    }
+                }
+            }
+            // ── Acacia: short, strongly leaning, wide flat umbrella
+            4 => {
+                let h = 5 + (th >> 16) as i32 % 2; // 5-6
+                let mut sx = tx;
+                let mut sz = tz;
+                let lean_dir = (th >> 24) % 4;
+                for y in base_y..base_y + h {
+                    out.push((sx, y, sz, log_id));
+                    if y >= base_y + h / 2 {
+                        match lean_dir {
+                            0 => sx += 1,
+                            1 => sx -= 1,
+                            2 => sz += 1,
+                            _ => sz -= 1,
+                        }
+                    }
+                }
+                let cx = sx; let cz = sz;
+                let top = base_y + h;
+                // Wide flat umbrella: 7x7 bottom, 5x5 middle, 3x3 top
+                for &(r, dy) in &[(3i32,0i32),(3,1),(2,2),(1,3)] {
+                    for dz in -r..=r {
+                        for dx in -r..=r {
+                            if dx.abs() == r && dz.abs() == r {
+                                let ch = block_hash(cx+dx, top+dy, cz+dz, self.seed.wrapping_add(4));
+                                if ch % 3 == 0 { continue; }
+                            }
+                            out.push((cx+dx, top+dy, cz+dz, leaf_id));
+                        }
+                    }
+                }
+            }
+            // ── Cherry: medium, massive fluffy cloud crown (many blobs)
+            5 => {
+                let h = 5 + (th >> 16) as i32 % 3; // 5-7
+                for y in base_y..base_y + h {
+                    out.push((tx, y, tz, log_id));
+                }
+                let top = base_y + h;
+                // Dense blobs: 8 blobs, each 3x3x2
+                for blob in 0..8i32 {
+                    let bh = block_hash(tx, blob, tz, self.seed.wrapping_add(20 + blob as i64));
+                    let bx = tx + (bh % 5) as i32 - 2;
+                    let bz = tz + ((bh >> 4) % 5) as i32 - 2;
+                    let by = top - 1 + (bh >> 8) as i32 % 3;
+                    for dz in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            for dy in 0..2i32 {
+                                out.push((bx+dx, by+dy, bz+dz, leaf_id));
+                            }
+                        }
+                    }
+                }
+            }
+            // ── Dark Oak: short wide, 2x2 trunk, massive layered crown
+            6 => {
+                let h = 5 + (th >> 16) as i32 % 2; // 5-6
+                for y in base_y..base_y + h {
+                    out.push((tx,   y, tz,   log_id));
+                    out.push((tx+1, y, tz,   log_id));
+                    out.push((tx,   y, tz+1, log_id));
+                    out.push((tx+1, y, tz+1, log_id));
+                }
+                let top = base_y + h;
+                for &(r, dy) in &[(4i32,0i32),(4,1),(3,2),(2,3),(1,4)] {
+                    for dz in -r..=r {
+                        for dx in -r..=r {
+                            if dx.abs() == r && dz.abs() == r {
+                                let ch = block_hash(tx+dx, top+dy, tz+dz, self.seed.wrapping_add(30));
+                                if ch % 3 == 0 { continue; }
+                            }
+                            out.push((tx+dx, top+dy, tz+dz, leaf_id));
+                        }
+                    }
+                }
+            }
+            // ── Mangrove: medium, stilt roots, bushy crown
+            _ => {
+                let h = 5 + (th >> 16) as i32 % 3; // 5-7
+                for &(dx, dz) in &[(1i32,0i32),(0,1),(-1,0),(1,1)] {
+                    let rh = block_hash(tx+dx, 0, tz+dz, self.seed.wrapping_add(40));
+                    if rh % 2 == 0 {
+                        out.push((tx+dx, base_y-1, tz+dz, log_id));
+                        out.push((tx+dx, base_y,   tz+dz, log_id));
+                    }
+                }
+                for y in base_y..base_y + h {
+                    out.push((tx, y, tz, log_id));
+                }
+                gen_round_crown(&mut out, tx, tz, base_y + h, leaf_id, &[3, 3, 2, 1, 0], self.seed);
+            }
+        }
+
+        out
     }
 
     /// Try to place precious blocks (gold/diamond/emerald blocks) at high rings.
@@ -429,6 +573,33 @@ fn set_block_in_section(section: &mut ChunkSection, lx: u8, ly: u8, lz: u8, stat
         section.palette.push(state);
         section.blocks[index] = new_idx;
     }
+}
+
+
+/// Generate a round crown. `radii` = radius per layer from bottom, 0 = single block.
+fn gen_round_crown(
+    out: &mut Vec<(i32, i32, i32, BlockStateId)>,
+    cx: i32, cz: i32, top_y: i32,
+    leaf_id: BlockStateId,
+    radii: &[i32],
+    seed: i64,
+) {
+    for (layer, &r) in radii.iter().enumerate() {
+        let y = top_y + layer as i32 - radii.len() as i32 + 1;
+        for dz in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() == r && dz.abs() == r && r > 0 {
+                    let h = block_hash(cx+dx, y, cz+dz, seed.wrapping_add(50));
+                    if h % 2 == 0 { continue; }
+                }
+                let is_trunk = dx == 0 && dz == 0;
+                if !is_trunk {
+                    out.push((cx+dx, y, cz+dz, leaf_id));
+                }
+            }
+        }
+    }
+    out.push((cx, top_y, cz, leaf_id));
 }
 
 
