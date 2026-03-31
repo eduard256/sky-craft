@@ -89,27 +89,6 @@ impl ClientWorld {
         self.chunks.len()
     }
 
-    /// Get a chunk section by position.
-    pub fn get_chunk(&self, pos: &ChunkPos) -> Option<&ChunkSection> {
-        self.chunks.get(pos)
-    }
-
-    /// Insert a chunk section directly (for demo/testing).
-    pub fn insert_chunk(&mut self, pos: ChunkPos, section: ChunkSection) {
-        self.chunks.insert(pos, section);
-    }
-
-    /// Get all loaded chunk positions.
-    pub fn loaded_chunks(&self) -> impl Iterator<Item = &ChunkPos> {
-        self.chunks.keys()
-    }
-
-    /// Mark that chunks have changed (new chunk loaded).
-    pub fn chunks_changed(&self) -> bool {
-        // Simple: always rebuild for now. Real impl would track dirty flag.
-        true
-    }
-
     /// Process a packet received from the server.
     pub fn handle_server_packet(&mut self, packet: ServerPacket) {
         match packet {

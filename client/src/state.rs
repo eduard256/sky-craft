@@ -27,7 +27,7 @@ pub enum AppState {
 
 /// Top-level application struct.
 pub struct App {
-    pub state: AppState,
+    state: AppState,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     input: InputState,
@@ -62,6 +62,7 @@ impl ApplicationHandler for App {
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let window = Arc::new(window);
+                // Init renderer (async, but we block here for simplicity)
                 let renderer = pollster::block_on(Renderer::new(window.clone()));
                 match renderer {
                     Ok(r) => {
@@ -73,8 +74,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 self.window = Some(window);
-                // Start in Playing state with demo world for testing
-                self.state = AppState::Playing;
+                self.state = AppState::MainMenu;
             }
             Err(e) => {
                 warn!("Failed to create window: {}", e);
@@ -84,6 +84,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Pass to input handler first
         self.input.handle_event(&event);
 
         match event {
@@ -97,6 +98,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Main frame: update + render
                 self.update();
 
                 if let Some(renderer) = &mut self.renderer {
@@ -117,6 +119,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Request next frame
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -127,41 +130,27 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Per-frame update logic.
     fn update(&mut self) {
-        // Process camera input
-        if let Some(renderer) = &mut self.renderer {
-            // Mouse look
-            renderer.camera.process_mouse(self.input.mouse_dx, self.input.mouse_dy);
-
-            // WASD movement (free-fly for now, no gravity)
-            renderer.camera.process_movement(
-                self.input.is_forward(),
-                self.input.is_backward(),
-                self.input.is_left(),
-                self.input.is_right(),
-                self.input.is_jump(),
-                self.input.is_sneak(),
-                self.input.is_sprint(),
-            );
-        }
-
-        // Clear per-frame input state
-        self.input.begin_frame();
-
-        // Network
         match self.state {
+            AppState::MainMenu => {
+                // TODO: draw main menu UI, handle connect button
+            }
+            AppState::Connecting => {
+                // TODO: poll connection status
+            }
             AppState::Playing => {
+                // Process incoming packets from server
                 if let Some(ref mut net) = self.network {
                     while let Some(packet) = net.try_recv() {
                         self.world.handle_server_packet(packet);
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.mark_dirty();
-                        }
                     }
                 }
+
+                // Send player input to server
+                // TODO: send position/look/actions
             }
-            _ => {}
+            AppState::Initializing => {}
         }
     }
-
 }
