@@ -19,7 +19,7 @@ pub mod blocks {
     pub const DIRT: BlockStateId = 10;
     pub const COBBLESTONE: BlockStateId = 14;
     pub const OAK_PLANKS: BlockStateId = 15;
-    pub const OAK_LOG: BlockStateId = 73;
+    pub const OAK_LOG: BlockStateId = 126;
     pub const OAK_LEAVES: BlockStateId = 144;
     pub const SAND: BlockStateId = 66;
     pub const GRAVEL: BlockStateId = 68;
@@ -247,15 +247,27 @@ impl WorldGenerator {
 
     /// Generate a flat world chunk: one layer of GRASS_BLOCK at Y=64.
     fn generate_flat_chunk(&self, chunk_pos: ChunkPos) -> ChunkSection {
+        let base_x = chunk_pos.x * 16;
         let base_y = chunk_pos.y * 16;
+        let base_z = chunk_pos.z * 16;
         let mut section = ChunkSection::empty();
 
         for ly in 0..16u8 {
             let wy = base_y + ly as i32;
             if wy == 64 {
+                // Grass floor
                 for lz in 0..16u8 {
                     for lx in 0..16u8 {
                         set_block_in_section(&mut section, lx, ly, lz, blocks::GRASS_BLOCK);
+                    }
+                }
+            }
+
+            // Log poles every 8 blocks, height 65-68
+            if wy >= 65 && wy <= 68 {
+                for lz in (0u8..16).step_by(8) {
+                    for lx in (0u8..16).step_by(8) {
+                        set_block_in_section(&mut section, lx, ly, lz, blocks::OAK_LOG);
                     }
                 }
             }
@@ -337,6 +349,7 @@ fn set_block_in_section(section: &mut ChunkSection, lx: u8, ly: u8, lz: u8, stat
         section.blocks[index] = new_idx;
     }
 }
+
 
 /// Deterministic hash for a block position + seed. Fast, not cryptographic.
 fn block_hash(x: i32, y: i32, z: i32, seed: i64) -> u64 {

@@ -382,14 +382,42 @@ impl App {
         let dx = move_dir.x * speed * dt;
         let dz = move_dir.z * speed * dt;
 
-        let new_x = self.world.player.position.x + dx as f64;
-        let new_z = self.world.player.position.z + dz as f64;
+        let cur_x = self.world.player.position.x;
+        let cur_y = self.world.player.position.y;
+        let cur_z = self.world.player.position.z;
+        const PLAYER_WIDTH: f64 = 0.3; // half-width
+        const PLAYER_HEIGHT_COL: f64 = 1.8;
 
-        // Only move if destination chunk is loaded (prevent falling into void)
+        // Helper: check if AABB at (cx, cy, cz) overlaps any solid block
+        let is_blocked = |cx: f64, cy: f64, cz: f64| -> bool {
+            use skycraft_protocol::types::BlockPos;
+            let x0 = (cx - PLAYER_WIDTH).floor() as i32;
+            let x1 = (cx + PLAYER_WIDTH).floor() as i32;
+            let y0 = cy.floor() as i32;
+            let y1 = (cy + PLAYER_HEIGHT_COL - 0.01).floor() as i32;
+            let z0 = (cz - PLAYER_WIDTH).floor() as i32;
+            let z1 = (cz + PLAYER_WIDTH).floor() as i32;
+            for bx in x0..=x1 {
+                for by in y0..=y1 {
+                    for bz in z0..=z1 {
+                        if self.world.get_block(BlockPos::new(bx, by, bz)) != 0 {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+
+        let new_x = cur_x + dx as f64;
+        let new_z = cur_z + dz as f64;
+
         let dest_chunk = skycraft_protocol::types::BlockPos { x: new_x.floor() as i32, y: 64, z: new_z.floor() as i32 }.to_chunk_pos();
         if self.world.is_chunk_loaded(&dest_chunk) {
-            self.world.player.position.x = new_x;
-            self.world.player.position.z = new_z;
+            let can_x = !is_blocked(new_x, cur_y, cur_z);
+            let can_z = !is_blocked(if can_x { new_x } else { cur_x }, cur_y, new_z);
+            if can_x { self.world.player.position.x = new_x; }
+            if can_z { self.world.player.position.z = new_z; }
         }
 
         // ── Gravity + jump ───────────────────────────────────────────────────
