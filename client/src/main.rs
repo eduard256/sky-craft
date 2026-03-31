@@ -12,6 +12,7 @@ mod state;
 mod session;
 mod auth_client;
 pub mod atlas;
+pub mod mesh;
 
 use tracing::info;
 use winit::event_loop::EventLoop;
