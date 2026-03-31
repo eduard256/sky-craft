@@ -81,8 +81,6 @@ impl InputState {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_dx += position.x - self.mouse_x;
-                self.mouse_dy += position.y - self.mouse_y;
                 self.mouse_x = position.x;
                 self.mouse_y = position.y;
             }

@@ -297,6 +297,10 @@ impl RenderPipeline {
     }
 
     /// Upload a chunk mesh to GPU.
+    pub fn remove_chunk_mesh(&mut self, pos: ChunkPos) {
+        self.chunk_meshes.remove(&pos);
+    }
+
     pub fn upload_chunk_mesh(&mut self, device: &Device, mesh: &ChunkMesh) {
         if mesh.is_empty() {
             self.chunk_meshes.remove(&mesh.chunk_pos);

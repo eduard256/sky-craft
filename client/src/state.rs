@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::collections::HashSet;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{WindowEvent, DeviceEvent, DeviceId};
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowId, WindowAttributes};
+use winit::window::{Window, WindowId, WindowAttributes, CursorGrabMode};
 use tracing::{info, warn};
 
 use crate::asset_downloader::{self, DownloadProgress};
@@ -116,6 +116,9 @@ pub struct App {
     /// Chunks that have been meshed (to avoid re-meshing).
     meshed_chunks: HashSet<ChunkPos>,
 
+    /// Chunks that need remesh (e.g. neighbor arrived).
+    dirty_chunks: HashSet<ChunkPos>,
+
     /// Set to true if init_game_rendering failed so we don't spam retries every frame.
     rendering_init_failed: bool,
 
@@ -178,6 +181,7 @@ impl App {
             move_send_timer: 0.0,
             hand: Hand::new(),
             meshed_chunks: HashSet::new(),
+            dirty_chunks: HashSet::new(),
             rendering_init_failed: false,
             download_rx,
             download_ui,
@@ -254,6 +258,26 @@ impl App {
     }
 
     /// Build meshes for any new chunks that arrived from server.
+    fn unload_distant_chunks(&mut self) {
+        const UNLOAD_DISTANCE: i32 = 12; // chunks beyond this get dropped
+
+        let px = (self.world.player.position.x / 16.0).floor() as i32;
+        let pz = (self.world.player.position.z / 16.0).floor() as i32;
+
+        let to_unload: Vec<ChunkPos> = self.world.loaded_chunk_positions()
+            .filter(|pos| (pos.x - px).abs() > UNLOAD_DISTANCE || (pos.z - pz).abs() > UNLOAD_DISTANCE)
+            .collect();
+
+        for pos in to_unload {
+            self.world.unload_chunk(&pos);
+            self.meshed_chunks.remove(&pos);
+            self.dirty_chunks.remove(&pos);
+            if let Some(pipeline) = &mut self.game_pipeline {
+                pipeline.remove_chunk_mesh(pos);
+            }
+        }
+    }
+
     fn mesh_new_chunks(&mut self) {
         let Some(atlas) = &self.atlas else { return };
         let Some(pipeline) = &mut self.game_pipeline else { return };
@@ -261,10 +285,30 @@ impl App {
 
         // Find chunks that exist in world but haven't been meshed
         let new_chunks: Vec<ChunkPos> = self.world.loaded_chunk_positions()
-            .filter(|pos| !self.meshed_chunks.contains(pos))
+            .filter(|pos| !self.meshed_chunks.contains(pos) && !self.dirty_chunks.contains(pos))
             .collect();
 
-        for chunk_pos in new_chunks {
+        // When a new chunk arrives, mark neighbors dirty (once, not every frame)
+        for chunk_pos in &new_chunks {
+            for n in [
+                ChunkPos::new(chunk_pos.x+1, chunk_pos.y, chunk_pos.z),
+                ChunkPos::new(chunk_pos.x-1, chunk_pos.y, chunk_pos.z),
+                ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z+1),
+                ChunkPos::new(chunk_pos.x, chunk_pos.y, chunk_pos.z-1),
+            ] {
+                if self.meshed_chunks.contains(&n) {
+                    self.meshed_chunks.remove(&n);
+                    self.dirty_chunks.insert(n);
+                }
+            }
+        }
+
+        // Process new chunks + up to 4 dirty chunks per frame
+        let dirty_batch: Vec<ChunkPos> = self.dirty_chunks.iter().take(4).copied().collect();
+        for pos in &dirty_batch { self.dirty_chunks.remove(pos); }
+        let chunks_to_mesh: Vec<ChunkPos> = new_chunks.into_iter().chain(dirty_batch).collect();
+
+        for chunk_pos in chunks_to_mesh {
             let section = match self.world.get_chunk(&chunk_pos) {
                 Some(s) => s,
                 None => continue,
@@ -580,6 +624,15 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, event: DeviceEvent) {
+        if self.ui.screen == AppScreen::Playing {
+            if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+                self.input.mouse_dx += dx;
+                self.input.mouse_dy += dy;
+            }
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // In playing mode, don't let egui consume mouse events (camera needs them)
         let egui_wants = if self.ui.screen == AppScreen::Playing {
@@ -667,6 +720,7 @@ impl App {
         // Init rendering, mesh chunks, update game
         if self.ui.screen == AppScreen::Playing {
             self.init_game_rendering();
+            self.unload_distant_chunks();
             self.mesh_new_chunks();
             self.update_game(dt);
         }
@@ -763,6 +817,11 @@ impl App {
             UiAction::GoToMainMenu => {
                 self.ui.screen = AppScreen::MainMenu;
                 self.ui.status_message.clear();
+                // Release cursor when leaving game
+                if let Some(window) = &self.window {
+                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                }
             }
             UiAction::LoginBackToNickname => {
                 self.ui.login_step = LoginStep::EnterNickname;
@@ -842,6 +901,13 @@ impl App {
                 self.ui.status_message.clear();
                 self.ui.screen = AppScreen::Playing;
                 self.net = Some(bridge);
+
+                // Grab cursor for FPS-style mouse look
+                if let Some(window) = &self.window {
+                    let _ = window.set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                    window.set_cursor_visible(false);
+                }
 
                 // Reset game state for new connection
                 self.world = ClientWorld::new();

@@ -99,6 +99,11 @@ impl ClientWorld {
         self.chunks.len()
     }
 
+    /// Unload a chunk from client memory.
+    pub fn unload_chunk(&mut self, pos: &ChunkPos) {
+        self.chunks.remove(pos);
+    }
+
     /// Process a packet received from the server.
     pub fn handle_server_packet(&mut self, packet: ServerPacket) {
         match packet {
