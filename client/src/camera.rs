@@ -95,8 +95,8 @@ impl Camera {
         let dx = dx as f32 * self.sensitivity;
         let dy = dy as f32 * self.sensitivity;
 
-        // Yaw: mouse right = rotate right (increase yaw)
-        self.yaw += dx.to_radians();
+        // Yaw: mouse right = rotate right (decrease yaw)
+        self.yaw -= dx.to_radians();
 
         // Wrap yaw to 0..2PI
         self.yaw = self.yaw.rem_euclid(std::f32::consts::TAU);

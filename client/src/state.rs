@@ -302,27 +302,30 @@ impl App {
             self.camera.process_mouse(self.input.mouse_dx, self.input.mouse_dy);
         }
 
-        // ── Client-side physics ──────────────────────────────────────────────
-        const GRAVITY: f32 = -28.0;
-        const JUMP_SPEED: f32 = 8.5;
+        // ── Client-side movement ─────────────────────────────────────────────
         const WALK_SPEED: f32 = 4.3;
         const SPRINT_SPEED: f32 = 5.6;
-        const PLAYER_HEIGHT: f32 = 1.8;
-        const PLAYER_WIDTH: f32 = 0.6;
 
-        let sprinting = self.input.is_sprint();
-        let speed = if sprinting { SPRINT_SPEED } else { WALK_SPEED };
+        let speed = if self.input.is_sprint() { SPRINT_SPEED } else { WALK_SPEED };
 
         // Horizontal movement direction from input
         let mut move_dir = glam::Vec3::ZERO;
         if self.input.is_forward()  { move_dir += self.camera.forward_xz(); }
         if self.input.is_backward() { move_dir -= self.camera.forward_xz(); }
-        if self.input.is_right()    { move_dir += self.camera.right_xz(); }
-        if self.input.is_left()     { move_dir -= self.camera.right_xz(); }
+        if self.input.is_right()    { move_dir -= self.camera.right_xz(); }
+        if self.input.is_left()     { move_dir += self.camera.right_xz(); }
         if move_dir.length_squared() > 0.0 { move_dir = move_dir.normalize(); }
 
-        self.velocity.x = move_dir.x * speed;
-        self.velocity.z = move_dir.z * speed;
+        let dx = move_dir.x * speed * dt;
+        let dz = move_dir.z * speed * dt;
+
+        self.world.player.position.x += dx as f64;
+        self.world.player.position.z += dz as f64;
+
+        // ── Gravity + jump ───────────────────────────────────────────────────
+        const GRAVITY: f32 = -20.0;
+        const JUMP_SPEED: f32 = 7.0;
+        const PLAYER_HEIGHT: f64 = 1.8;
 
         // Jump
         if self.input.is_jump() && self.on_ground {
@@ -330,93 +333,63 @@ impl App {
             self.on_ground = false;
         }
 
-        // Gravity
+        // Apply gravity
         if !self.on_ground {
             self.velocity.y += GRAVITY * dt;
-            self.velocity.y = self.velocity.y.max(-50.0);
         }
 
-        // Move with AABB collision — work on copied position to avoid borrow issues
-        let half_w = (PLAYER_WIDTH / 2.0) as f64;
-        let mut px = self.world.player.position.x;
+        // Move Y — copy coords to avoid borrow conflict
         let mut py = self.world.player.position.y;
-        let mut pz = self.world.player.position.z;
+        let px2 = self.world.player.position.x;
+        let pz2 = self.world.player.position.z;
+        py += self.velocity.y as f64 * dt as f64;
 
-        // Move Y
-        let dy = self.velocity.y as f64 * dt as f64;
-        let new_y = py + dy;
-        let foot_y = new_y;
-        let head_y = new_y + PLAYER_HEIGHT as f64;
-        let mut y_blocked = false;
-        for cx in [px - half_w + 0.001, px + half_w - 0.001] {
-            for cz in [pz - half_w + 0.001, pz + half_w - 0.001] {
-                if dy < 0.0 { y_blocked |= self.world.get_block(skycraft_protocol::types::BlockPos { x: cx.floor() as i32, y: foot_y.floor() as i32, z: cz.floor() as i32 }) != 0; }
-                if dy > 0.0 { y_blocked |= self.world.get_block(skycraft_protocol::types::BlockPos { x: cx.floor() as i32, y: head_y.floor() as i32, z: cz.floor() as i32 }) != 0; }
-            }
-        }
-        if y_blocked {
-            if self.velocity.y < 0.0 { py = foot_y.ceil(); self.on_ground = true; }
-            else { py = head_y.floor() - PLAYER_HEIGHT as f64; }
+        let foot_block = self.world.get_block(skycraft_protocol::types::BlockPos {
+            x: px2.floor() as i32,
+            y: (py - 0.01).floor() as i32,
+            z: pz2.floor() as i32,
+        });
+        if foot_block != 0 && self.velocity.y <= 0.0 {
+            py = (py - 0.01).floor() + 1.0;
             self.velocity.y = 0.0;
-        } else {
-            py = new_y;
+            self.on_ground = true;
+        } else if foot_block == 0 {
             self.on_ground = false;
         }
 
-        // Check still on ground
-        if self.on_ground {
-            let mut still_on = false;
-            for cx in [px - half_w + 0.001, px + half_w - 0.001] {
-                for cz in [pz - half_w + 0.001, pz + half_w - 0.001] {
-                    still_on |= self.world.get_block(skycraft_protocol::types::BlockPos { x: cx.floor() as i32, y: (py - 0.01).floor() as i32, z: cz.floor() as i32 }) != 0;
-                }
-            }
-            if !still_on { self.on_ground = false; }
+        let head_block = self.world.get_block(skycraft_protocol::types::BlockPos {
+            x: px2.floor() as i32,
+            y: (py + PLAYER_HEIGHT).floor() as i32,
+            z: pz2.floor() as i32,
+        });
+        if head_block != 0 && self.velocity.y > 0.0 {
+            self.velocity.y = 0.0;
         }
 
-        // Move X
-        let dx = self.velocity.x as f64 * dt as f64;
-        let new_x = px + dx;
-        let check_x = if dx > 0.0 { new_x + half_w } else { new_x - half_w };
-        let mut x_blocked = false;
-        for cy in [py + 0.001, py + 0.9, py + 1.7] {
-            for cz in [pz - half_w + 0.001, pz + half_w - 0.001] {
-                x_blocked |= self.world.get_block(skycraft_protocol::types::BlockPos { x: check_x.floor() as i32, y: cy.floor() as i32, z: cz.floor() as i32 }) != 0;
-            }
-        }
-        if !x_blocked { px = new_x; } else { self.velocity.x = 0.0; }
-
-        // Move Z
-        let dz = self.velocity.z as f64 * dt as f64;
-        let new_z = pz + dz;
-        let check_z = if dz > 0.0 { new_z + half_w } else { new_z - half_w };
-        let mut z_blocked = false;
-        for cy in [py + 0.001, py + 0.9, py + 1.7] {
-            for cx in [px - half_w + 0.001, px + half_w - 0.001] {
-                z_blocked |= self.world.get_block(skycraft_protocol::types::BlockPos { x: cx.floor() as i32, y: cy.floor() as i32, z: check_z.floor() as i32 }) != 0;
-            }
-        }
-        if !z_blocked { pz = new_z; } else { self.velocity.z = 0.0; }
-
-        // Write back position
-        self.world.player.position.x = px;
         self.world.player.position.y = py;
-        self.world.player.position.z = pz;
+        // ────────────────────────────────────────────────────────────────────
 
         // Sync camera to player position
-        self.camera.position = glam::Vec3::new(px as f32, py as f32, pz as f32);
+        self.camera.position = glam::Vec3::new(
+            self.world.player.position.x as f32,
+            self.world.player.position.y as f32,
+            self.world.player.position.z as f32,
+        );
 
         // Send position to server every 50ms
         self.move_send_timer += dt;
         if self.move_send_timer >= 0.05 {
             self.move_send_timer = 0.0;
+            let px = self.world.player.position.x;
+            let py = self.world.player.position.y;
+            let pz = self.world.player.position.z;
             if let Some(net) = &self.net {
                 net.send(skycraft_protocol::packets::ClientPacket::PlayerPositionAndLook(
                     skycraft_protocol::packets::C2SPlayerPositionAndLook {
                         x: px, y: py, z: pz,
                         yaw: self.camera.yaw,
                         pitch: self.camera.pitch,
-                        on_ground: self.on_ground,
+                        on_ground: true,
                     }
                 ));
             }
