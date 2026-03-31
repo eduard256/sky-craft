@@ -20,7 +20,7 @@ pub mod blocks {
     pub const COBBLESTONE: BlockStateId = 14;
     pub const OAK_PLANKS: BlockStateId = 15;
     pub const OAK_LOG: BlockStateId = 126;
-    pub const OAK_LEAVES: BlockStateId = 144;
+    pub const OAK_LEAVES: BlockStateId = 233;
     pub const SAND: BlockStateId = 66;
     pub const GRAVEL: BlockStateId = 68;
     pub const COAL_ORE: BlockStateId = 36;
@@ -252,28 +252,109 @@ impl WorldGenerator {
         let base_z = chunk_pos.z * 16;
         let mut section = ChunkSection::empty();
 
-        for ly in 0..16u8 {
-            let wy = base_y + ly as i32;
-            if wy == 64 {
-                // Grass floor
-                for lz in 0..16u8 {
-                    for lx in 0..16u8 {
-                        set_block_in_section(&mut section, lx, ly, lz, blocks::GRASS_BLOCK);
-                    }
+        // Grass floor at Y=64
+        if base_y <= 64 && 64 < base_y + 16 {
+            let ly = (64 - base_y) as u8;
+            for lz in 0..16u8 {
+                for lx in 0..16u8 {
+                    set_block_in_section(&mut section, lx, ly, lz, blocks::GRASS_BLOCK);
                 }
             }
+        }
 
-            // Log poles every 8 blocks, height 65-68
-            if wy >= 65 && wy <= 68 {
-                for lz in (0u8..16).step_by(8) {
-                    for lx in (0u8..16).step_by(8) {
-                        set_block_in_section(&mut section, lx, ly, lz, blocks::OAK_LOG);
+        // Place tree blocks from nearby chunk columns (radius 2)
+        for tcx in (chunk_pos.x - 2)..=(chunk_pos.x + 2) {
+            for tcz in (chunk_pos.z - 2)..=(chunk_pos.z + 2) {
+                for tree in self.flat_trees_in_column(tcx, tcz) {
+                    // Place each block of this tree if it falls in our chunk section
+                    for (wx, wy, wz, block) in &tree {
+                        let lx = wx - base_x;
+                        let ly = wy - base_y;
+                        let lz = wz - base_z;
+                        if lx >= 0 && lx < 16 && ly >= 0 && ly < 16 && lz >= 0 && lz < 16 {
+                            set_block_in_section(&mut section, lx as u8, ly as u8, lz as u8, *block);
+                        }
                     }
                 }
             }
         }
 
         section
+    }
+
+    /// Generate all trees for a chunk column (cx, cz). Returns world-space blocks.
+    fn flat_trees_in_column(&self, cx: i32, cz: i32) -> Vec<Vec<(i32, i32, i32, BlockStateId)>> {
+        let mut trees = Vec::new();
+        let base_x = cx * 16;
+        let base_z = cz * 16;
+
+        // Deterministic: how many trees in this column (0-2)
+        let col_hash = block_hash(cx, 0, cz, self.seed);
+        let tree_count = (col_hash % 3) as i32; // 0, 1, or 2 trees
+
+        for i in 0..tree_count {
+            let th = block_hash(cx, i, cz, self.seed.wrapping_add(1));
+
+            // Random position within column (avoid edges so logs are fully inside)
+            let tx = base_x + 2 + (th % 12) as i32;
+            let tz = base_z + 2 + ((th >> 8) % 12) as i32;
+
+            // Random height 4-7
+            let height = 4 + ((th >> 16) % 4) as i32;
+            let top_y = 65 + height - 1; // trunk top world Y
+
+            let mut blocks_out: Vec<(i32, i32, i32, BlockStateId)> = Vec::new();
+
+            // Trunk with optional lean
+            let mut sx = tx;
+            let mut sz = tz;
+            for y in 65..(65 + height) {
+                blocks_out.push((sx, y, sz, blocks::OAK_LOG));
+                // Lean: every 3 blocks shift 1 in a random direction
+                if y % 3 == 0 {
+                    let lean_h = block_hash(sx, y, sz, self.seed.wrapping_add(2));
+                    match lean_h % 5 {
+                        0 => sx += 1,
+                        1 => sx -= 1,
+                        2 => sz += 1,
+                        3 => sz -= 1,
+                        _ => {} // straight
+                    }
+                }
+            }
+            let crown_x = sx;
+            let crown_z = sz;
+
+            // Crown: 5x5 two layers below top, 3x3 at top, 1x1 tip
+            for layer in 0..4i32 {
+                let cy = top_y - 1 + layer;
+                let radius: i32 = match layer {
+                    0 => 2, // 5x5
+                    1 => 2, // 5x5
+                    2 => 1, // 3x3
+                    _ => 0, // 1x1 tip
+                };
+                for dz in -radius..=radius {
+                    for dx in -radius..=radius {
+                        // Skip corners on 5x5 for rounder look
+                        if radius == 2 && dx.abs() == 2 && dz.abs() == 2 {
+                            // Randomly drop corners
+                            let corner_h = block_hash(crown_x + dx, cy, crown_z + dz, self.seed.wrapping_add(3));
+                            if corner_h % 2 == 0 { continue; }
+                        }
+                        // Don't overwrite trunk log
+                        let is_trunk = blocks_out.iter().any(|&(bx, by, bz, _)| bx == crown_x+dx && by == cy && bz == crown_z+dz);
+                        if !is_trunk {
+                            blocks_out.push((crown_x + dx, cy, crown_z + dz, blocks::OAK_LEAVES));
+                        }
+                    }
+                }
+            }
+
+            trees.push(blocks_out);
+        }
+
+        trees
     }
 
     /// Try to place precious blocks (gold/diamond/emerald blocks) at high rings.
