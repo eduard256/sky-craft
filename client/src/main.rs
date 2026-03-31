@@ -13,6 +13,7 @@ mod session;
 mod auth_client;
 pub mod atlas;
 pub mod mesh;
+pub mod camera;
 
 use tracing::info;
 use winit::event_loop::EventLoop;
