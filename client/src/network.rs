@@ -62,29 +62,40 @@ impl NetworkClient {
         let bytes = codec::encode_client_packet(&login)?;
         send.write_all(&bytes).await?;
 
-        // Read login response
-        let mut buf = vec![0u8; 65536];
-        let n = recv.read(&mut buf).await?
-            .ok_or("Connection closed during login")?;
+        // Read login response.
+        // We accumulate data until we can decode a complete packet, then preserve
+        // any leftover bytes in self.read_buf so poll() picks them up without gaps.
+        let mut login_buf: Vec<u8> = Vec::new();
+        let mut tmp = vec![0u8; 65536];
 
-        let (response, _) = codec::decode_server_packet(&buf[..n])?
-            .ok_or("Incomplete login response")?;
+        let login_success = loop {
+            let n = recv.read(&mut tmp).await?
+                .ok_or("Connection closed during login")?;
+            login_buf.extend_from_slice(&tmp[..n]);
 
-        match response {
-            ServerPacket::LoginSuccess(success) => {
-                info!("Logged in as {} ({})", success.nickname, success.player_uuid);
-                self.connection = Some(connection);
-                self.send = Some(send);
-                self.recv = Some(recv);
-                Ok(success)
+            match codec::decode_server_packet(&login_buf)? {
+                Some((ServerPacket::LoginSuccess(success), consumed)) => {
+                    // Save any bytes that arrived after LoginSuccess (next packets)
+                    self.read_buf.extend_from_slice(&login_buf[consumed..]);
+                    break success;
+                }
+                Some((ServerPacket::Disconnect(d), _)) => {
+                    return Err(format!("Login rejected: {}", d.reason).into());
+                }
+                Some(_) => {
+                    return Err("Unexpected response during login".into());
+                }
+                None => {
+                    // Incomplete packet, read more
+                }
             }
-            ServerPacket::Disconnect(d) => {
-                Err(format!("Login rejected: {}", d.reason).into())
-            }
-            _ => {
-                Err("Unexpected response during login".into())
-            }
-        }
+        };
+
+        info!("Logged in as {} ({})", login_success.nickname, login_success.player_uuid);
+        self.connection = Some(connection);
+        self.send = Some(send);
+        self.recv = Some(recv);
+        Ok(login_success)
     }
 
     /// Send a packet to the server.
