@@ -184,6 +184,36 @@ impl GameState {
             }
         });
 
+        // Send new chunks if player moved to a new chunk column
+        if let Some(old) = old_pos {
+            let old_cx = (old.x / 16.0).floor() as i32;
+            let old_cz = (old.z / 16.0).floor() as i32;
+            let new_cx = (pos.x / 16.0).floor() as i32;
+            let new_cz = (pos.z / 16.0).floor() as i32;
+
+            if old_cx != new_cx || old_cz != new_cz {
+                let vd = self.config.view_distance as i32;
+                let mut packets = Vec::new();
+                for cx in (new_cx - vd)..=(new_cx + vd) {
+                    for cz in (new_cz - vd)..=(new_cz + vd) {
+                        if (cx - old_cx).abs() <= vd && (cz - old_cz).abs() <= vd {
+                            continue;
+                        }
+                        for cy in -4..20 {
+                            let chunk_pos = ChunkPos::new(cx, cy, cz);
+                            let section = self.world.get_or_generate_chunk(chunk_pos);
+                            if !section.is_empty() {
+                                packets.push(ServerPacket::ChunkData(S2CChunkData { chunk_pos, section }));
+                            }
+                        }
+                    }
+                }
+                self.with_player(entity_id, |p| {
+                    for pkt in packets { p.send_packet(pkt); }
+                });
+            }
+        }
+
         // Broadcast movement to other players
         if let Some(old) = old_pos {
             let dx = ((pos.x - old.x) * 4096.0) as i16;

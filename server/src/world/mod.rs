@@ -69,7 +69,7 @@ impl World {
     /// Get the world spawn position (center of ring 0, on a suitable island).
     pub fn get_spawn_position(&self) -> EntityPos {
         if self.config.flat_world {
-            return EntityPos::new(0.5, 65.0, 0.5);
+            return EntityPos::new(0.5, 67.0, 0.5);
         }
         // Find the first solid block near origin
         // Search in a spiral from 0,0 outward for a valid spawn point

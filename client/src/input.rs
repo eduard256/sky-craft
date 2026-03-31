@@ -114,9 +114,9 @@ impl InputState {
     pub fn is_backward(&self) -> bool { self.is_key_down(KeyCode::KeyS) }
     pub fn is_left(&self) -> bool { self.is_key_down(KeyCode::KeyA) }
     pub fn is_right(&self) -> bool { self.is_key_down(KeyCode::KeyD) }
-    pub fn is_jump(&self) -> bool { self.is_key_down(KeyCode::Space) }
+    pub fn is_jump(&self) -> bool { self.is_key_pressed(KeyCode::Space) }
     pub fn is_sneak(&self) -> bool { self.is_key_down(KeyCode::ShiftLeft) }
-    pub fn is_sprint(&self) -> bool { self.is_key_down(KeyCode::ControlLeft) }
+    pub fn is_sprint(&self) -> bool { self.is_key_down(KeyCode::ShiftLeft) }
 
     /// Get hotbar slot from number keys (1-9 -> 0-8), or None.
     pub fn hotbar_key_pressed(&self) -> Option<u8> {

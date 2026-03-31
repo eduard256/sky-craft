@@ -174,7 +174,7 @@ impl App {
             game_pipeline: None,
             camera: Camera::new(8),
             velocity: glam::Vec3::ZERO,
-            on_ground: false,
+            on_ground: true,
             move_send_timer: 0.0,
             hand: Hand::new(),
             meshed_chunks: HashSet::new(),
@@ -303,8 +303,8 @@ impl App {
         }
 
         // ── Client-side movement ─────────────────────────────────────────────
-        const WALK_SPEED: f32 = 4.3;
-        const SPRINT_SPEED: f32 = 5.6;
+        const WALK_SPEED: f32 = 8.6;
+        const SPRINT_SPEED: f32 = 34.4;
 
         let speed = if self.input.is_sprint() { SPRINT_SPEED } else { WALK_SPEED };
 
@@ -319,8 +319,15 @@ impl App {
         let dx = move_dir.x * speed * dt;
         let dz = move_dir.z * speed * dt;
 
-        self.world.player.position.x += dx as f64;
-        self.world.player.position.z += dz as f64;
+        let new_x = self.world.player.position.x + dx as f64;
+        let new_z = self.world.player.position.z + dz as f64;
+
+        // Only move if destination chunk is loaded (prevent falling into void)
+        let dest_chunk = skycraft_protocol::types::BlockPos { x: new_x.floor() as i32, y: 64, z: new_z.floor() as i32 }.to_chunk_pos();
+        if self.world.is_chunk_loaded(&dest_chunk) {
+            self.world.player.position.x = new_x;
+            self.world.player.position.z = new_z;
+        }
 
         // ── Gravity + jump ───────────────────────────────────────────────────
         const GRAVITY: f32 = -20.0;
@@ -333,15 +340,27 @@ impl App {
             self.on_ground = false;
         }
 
-        // Apply gravity
-        if !self.on_ground {
+        // Apply gravity only if chunk below is loaded
+        let px2 = self.world.player.position.x;
+        let pz2 = self.world.player.position.z;
+        let py_cur = self.world.player.position.y;
+        let below_chunk = skycraft_protocol::types::BlockPos {
+            x: px2.floor() as i32,
+            y: (py_cur - 1.0).floor() as i32,
+            z: pz2.floor() as i32,
+        }.to_chunk_pos();
+        let chunk_below_loaded = self.world.is_chunk_loaded(&below_chunk);
+
+        if !self.on_ground && chunk_below_loaded {
             self.velocity.y += GRAVITY * dt;
+        } else if !chunk_below_loaded {
+            // Freeze until chunks load
+            self.velocity.y = 0.0;
+            self.on_ground = true;
         }
 
         // Move Y — copy coords to avoid borrow conflict
-        let mut py = self.world.player.position.y;
-        let px2 = self.world.player.position.x;
-        let pz2 = self.world.player.position.z;
+        let mut py = py_cur;
         py += self.velocity.y as f64 * dt as f64;
 
         let foot_block = self.world.get_block(skycraft_protocol::types::BlockPos {
