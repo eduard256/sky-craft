@@ -58,3 +58,6 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 # Directories
 dirs = "6"
+
+# ZIP extraction for asset downloading
+zip = { version = "2", default-features = false, features = ["deflate"] }

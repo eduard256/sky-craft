@@ -17,6 +17,7 @@ pub mod camera;
 pub mod hand;
 pub mod pipeline;
 pub mod net_bridge;
+pub mod asset_downloader;
 
 use tracing::info;
 use winit::event_loop::EventLoop;

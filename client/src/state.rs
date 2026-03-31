@@ -2,12 +2,15 @@
 // Integrates: renderer, camera, hand, atlas, pipeline, mesh building, network.
 
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::collections::HashSet;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId, WindowAttributes};
 use tracing::{info, warn};
+
+use crate::asset_downloader::{self, DownloadProgress};
 
 use skycraft_protocol::types::ChunkPos;
 
@@ -47,6 +50,18 @@ struct UiState {
     status_message: String,
     saved_token: Option<String>,
     login_step: LoginStep,
+}
+
+/// State for the asset download modal shown over the main menu.
+struct AssetDownloadUi {
+    /// Whether the modal should be visible.
+    show: bool,
+    /// Human-readable status line shown below the progress bar.
+    status: String,
+    /// Progress value in 0.0–1.0. Negative means indeterminate (spinner).
+    progress: f32,
+    /// Set to true on error so the user can dismiss and retry later.
+    has_error: bool,
 }
 
 /// Action returned from UI drawing (deferred execution after egui frame).
@@ -92,6 +107,13 @@ pub struct App {
     /// Chunks that have been meshed (to avoid re-meshing).
     meshed_chunks: HashSet<ChunkPos>,
 
+    /// Receiver end of the asset download progress channel.
+    /// None when no download is in progress (or already done).
+    download_rx: Option<mpsc::Receiver<DownloadProgress>>,
+
+    /// State for the download modal overlay.
+    download_ui: AssetDownloadUi,
+
     /// Frame timing.
     last_frame_time: std::time::Instant,
 }
@@ -104,6 +126,27 @@ impl App {
                 (Some(s.token), s.nickname)
             }
             None => (None, String::new()),
+        };
+
+        // Check whether game assets exist. If not, start downloading immediately
+        // so by the time the window appears the download is already in progress.
+        let (download_rx, download_ui) = if asset_downloader::check_assets(".") {
+            (None, AssetDownloadUi {
+                show: false,
+                status: String::new(),
+                progress: 0.0,
+                has_error: false,
+            })
+        } else {
+            info!("Game assets missing — starting download...");
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || asset_downloader::download_assets(".", tx));
+            (Some(rx), AssetDownloadUi {
+                show: true,
+                status: "Connecting to GitHub...".to_string(),
+                progress: -1.0, // indeterminate until first byte arrives
+                has_error: false,
+            })
         };
 
         Self {
@@ -120,6 +163,8 @@ impl App {
             camera: Camera::new(8),
             hand: Hand::new(),
             meshed_chunks: HashSet::new(),
+            download_rx,
+            download_ui,
             last_frame_time: std::time::Instant::now(),
             ui: UiState {
                 screen: AppScreen::MainMenu,
@@ -278,6 +323,66 @@ impl App {
             pipeline.update_hand(renderer.queue(), &hand_uniform);
         }
     }
+
+    /// Drain all pending download progress messages and update download_ui accordingly.
+    fn drain_download_progress(&mut self) {
+        // Take ownership temporarily to avoid borrow issues.
+        let rx = match self.download_rx.take() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let mut done = false;
+
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                DownloadProgress::Downloading { downloaded_bytes, total_bytes } => {
+                    if let Some(total) = total_bytes {
+                        // First half of the overall progress bar is the download phase.
+                        let frac = downloaded_bytes as f32 / total as f32;
+                        self.download_ui.progress = frac * 0.5;
+                        self.download_ui.status = format!(
+                            "Downloading textures... {:.1} / {:.1} MB",
+                            downloaded_bytes as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0,
+                        );
+                    } else {
+                        self.download_ui.progress = -1.0; // indeterminate
+                        self.download_ui.status = format!(
+                            "Downloading textures... {:.1} MB",
+                            downloaded_bytes as f64 / 1_048_576.0,
+                        );
+                    }
+                }
+                DownloadProgress::Extracting { current, total } => {
+                    let frac = current as f32 / total as f32;
+                    // Second half of progress bar is extraction phase.
+                    self.download_ui.progress = 0.5 + frac * 0.5;
+                    self.download_ui.status = format!(
+                        "Extracting textures... {}/{}", current, total
+                    );
+                }
+                DownloadProgress::Done => {
+                    self.download_ui.progress = 1.0;
+                    self.download_ui.status = "Done!".to_string();
+                    self.download_ui.show = false;
+                    done = true;
+                    info!("Asset download complete");
+                }
+                DownloadProgress::Error(e) => {
+                    self.download_ui.status = format!("Download failed: {}", e);
+                    self.download_ui.has_error = true;
+                    done = true;
+                    warn!("Asset download error: {}", e);
+                }
+            }
+        }
+
+        // Put the receiver back unless the channel is finished.
+        if !done {
+            self.download_rx = Some(rx);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -409,6 +514,9 @@ impl App {
 
         // ── Phase 1: Game update (no egui borrows) ──────────────────────
 
+        // Drain asset download progress messages
+        self.drain_download_progress();
+
         // Drain network packets
         if let Some(ref net) = self.net {
             for packet in net.drain_packets() {
@@ -431,7 +539,7 @@ impl App {
         let raw_input = egui_state.take_egui_input(window);
         self.egui_ctx.begin_pass(raw_input);
 
-        let action = draw_ui(&self.egui_ctx, &mut self.ui, &self.world);
+        let action = draw_ui(&self.egui_ctx, &mut self.ui, &self.world, &self.download_ui);
 
         let full_output = self.egui_ctx.end_pass();
 
@@ -620,13 +728,20 @@ impl App {
 
 // ─── UI Drawing ─────────────────────────────────────────────────────────────
 
-fn draw_ui(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld) -> UiAction {
-    match ui.screen {
+fn draw_ui(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld, dl: &AssetDownloadUi) -> UiAction {
+    let action = match ui.screen {
         AppScreen::MainMenu => draw_main_menu(ctx, ui),
         AppScreen::Login => draw_login(ctx, ui),
         AppScreen::Connecting => draw_connecting(ctx, ui),
         AppScreen::Playing => draw_playing(ctx, ui, world),
+    };
+
+    // Asset download modal: shown over any screen (typically MainMenu on first run).
+    if dl.show || dl.has_error {
+        draw_download_modal(ctx, dl);
     }
+
+    action
 }
 
 fn draw_main_menu(ctx: &egui::Context, ui: &mut UiState) -> UiAction {
@@ -745,4 +860,39 @@ fn draw_playing(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld) -> U
         });
     });
     UiAction::None
+}
+
+fn draw_download_modal(ctx: &egui::Context, dl: &AssetDownloadUi) {
+    egui::Window::new("Downloading game assets")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .min_width(380.0)
+        .show(ctx, |p| {
+            p.vertical_centered(|p| {
+                p.add_space(8.0);
+
+                if dl.has_error {
+                    p.colored_label(egui::Color32::RED, &dl.status);
+                    p.add_space(8.0);
+                    p.label("Please run the game again to retry,");
+                    p.label("or run scripts/download_assets.sh manually.");
+                } else if dl.progress < 0.0 {
+                    // Indeterminate — no Content-Length from server yet.
+                    p.spinner();
+                    p.add_space(6.0);
+                    p.label(&dl.status);
+                } else {
+                    p.add(
+                        egui::ProgressBar::new(dl.progress)
+                            .desired_width(340.0)
+                            .animate(dl.progress < 1.0),
+                    );
+                    p.add_space(6.0);
+                    p.label(&dl.status);
+                }
+
+                p.add_space(8.0);
+            });
+        });
 }

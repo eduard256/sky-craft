@@ -54,7 +54,6 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/${TARGET}/release/${BINARY}" dist/
-          cp scripts/download_assets.sh dist/
           cd dist && tar czf "../${ARTIFACT}.tar.gz" *
 
       - name: Package (Windows)
@@ -67,7 +66,6 @@ jobs:
         run: |
           mkdir dist
           copy "target\${env:TARGET}\release\${env:BINARY}" dist\
-          copy scripts\download_assets.sh dist\
           Compress-Archive -Path dist\* -DestinationPath "${env:ARTIFACT}.zip"
 
       - name: Upload artifact
