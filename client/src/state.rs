@@ -1,11 +1,15 @@
 // Application state and winit event handling with egui UI.
+// Integrates: renderer, camera, hand, atlas, pipeline, mesh building, network.
 
 use std::sync::Arc;
+use std::collections::HashSet;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId, WindowAttributes};
 use tracing::{info, warn};
+
+use skycraft_protocol::types::ChunkPos;
 
 use crate::renderer::Renderer;
 use crate::input::InputState;
@@ -13,6 +17,11 @@ use crate::world::ClientWorld;
 use crate::session;
 use crate::auth_client;
 use crate::net_bridge::NetBridge;
+use crate::atlas::TextureAtlas;
+use crate::pipeline::RenderPipeline;
+use crate::camera::Camera;
+use crate::hand::Hand;
+use crate::mesh;
 
 /// Application state machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +76,24 @@ pub struct App {
 
     /// Network bridge (alive while connected to server).
     net: Option<NetBridge>,
+
+    /// Texture atlas (built once on first connect).
+    atlas: Option<TextureAtlas>,
+
+    /// Render pipeline (built after atlas).
+    game_pipeline: Option<RenderPipeline>,
+
+    /// First-person camera.
+    camera: Camera,
+
+    /// Hand model + animation.
+    hand: Hand,
+
+    /// Chunks that have been meshed (to avoid re-meshing).
+    meshed_chunks: HashSet<ChunkPos>,
+
+    /// Frame timing.
+    last_frame_time: std::time::Instant,
 }
 
 impl App {
@@ -88,6 +115,12 @@ impl App {
             egui_state: None,
             egui_renderer: None,
             net: None,
+            atlas: None,
+            game_pipeline: None,
+            camera: Camera::new(8),
+            hand: Hand::new(),
+            meshed_chunks: HashSet::new(),
+            last_frame_time: std::time::Instant::now(),
             ui: UiState {
                 screen: AppScreen::MainMenu,
                 server_address: "127.0.0.1".to_string(),
@@ -97,6 +130,152 @@ impl App {
                 saved_token,
                 login_step: LoginStep::EnterNickname,
             },
+        }
+    }
+
+    /// Build atlas and pipeline (called once after first connection).
+    fn init_game_rendering(&mut self) {
+        let Some(renderer) = &self.renderer else { return };
+        if self.atlas.is_some() { return; } // already initialized
+
+        info!("Building texture atlas...");
+        let atlas = match TextureAtlas::build(
+            renderer.device(),
+            renderer.queue(),
+            "common/data",
+            "client/assets/textures/minecraft/textures/block",
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("Failed to build atlas: {}", e);
+                return;
+            }
+        };
+
+        info!("Creating render pipeline...");
+        let pipeline = match RenderPipeline::new(
+            renderer.device(),
+            renderer.queue(),
+            renderer.surface_format(),
+            renderer.size().width,
+            renderer.size().height,
+            &atlas,
+            "client/assets/textures/minecraft/textures/entity/steve.png",
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to create pipeline: {}", e);
+                return;
+            }
+        };
+
+        self.atlas = Some(atlas);
+        self.game_pipeline = Some(pipeline);
+        info!("Game rendering initialized");
+    }
+
+    /// Build meshes for any new chunks that arrived from server.
+    fn mesh_new_chunks(&mut self) {
+        let Some(atlas) = &self.atlas else { return };
+        let Some(pipeline) = &mut self.game_pipeline else { return };
+        let Some(renderer) = &self.renderer else { return };
+
+        // Find chunks that exist in world but haven't been meshed
+        let new_chunks: Vec<ChunkPos> = self.world.loaded_chunk_positions()
+            .filter(|pos| !self.meshed_chunks.contains(pos))
+            .collect();
+
+        for chunk_pos in new_chunks {
+            let section = match self.world.get_chunk(&chunk_pos) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if section.is_empty() {
+                self.meshed_chunks.insert(chunk_pos);
+                continue;
+            }
+
+            // Build mesh with neighbor lookup
+            let world_ref = &self.world;
+            let chunk_mesh = mesh::build_chunk_mesh(
+                chunk_pos,
+                &section,
+                atlas,
+                &|wx, wy, wz| {
+                    use skycraft_protocol::types::BlockPos;
+                    world_ref.get_block(BlockPos::new(wx, wy, wz))
+                },
+            );
+
+            if !chunk_mesh.is_empty() {
+                pipeline.upload_chunk_mesh(renderer.device(), &chunk_mesh);
+            }
+
+            self.meshed_chunks.insert(chunk_pos);
+        }
+    }
+
+    /// Update camera and hand each frame.
+    fn update_game(&mut self, dt: f32) {
+        // Sync camera position from server player position
+        self.camera.position = glam::Vec3::new(
+            self.world.player.position.x as f32,
+            self.world.player.position.y as f32,
+            self.world.player.position.z as f32,
+        );
+
+        // Mouse look (only when playing and not in menu)
+        if self.ui.screen == AppScreen::Playing {
+            self.camera.process_mouse(self.input.mouse_dx, self.input.mouse_dy);
+        }
+
+        // Walking state
+        let is_walking = self.input.is_forward() || self.input.is_backward()
+            || self.input.is_left() || self.input.is_right();
+        self.camera.is_walking = is_walking;
+        self.camera.is_sprinting = self.input.is_sprint() && is_walking;
+
+        // Update camera (FOV smoothing, bobbing)
+        self.camera.update(dt);
+
+        // Sync hand with camera
+        self.hand.is_walking = is_walking;
+        self.hand.walk_cycle = self.camera.walk_cycle;
+        self.hand.update(dt);
+
+        // Left click -> swing hand
+        if self.input.mouse_clicked.contains(&winit::event::MouseButton::Left) {
+            self.hand.start_swing();
+        }
+
+        // Update camera aspect ratio
+        if let Some(renderer) = &self.renderer {
+            let size = renderer.size();
+            self.camera.set_aspect(size.width, size.height);
+        }
+
+        // Update GPU uniforms
+        if let (Some(pipeline), Some(renderer)) = (&self.game_pipeline, &self.renderer) {
+            // Camera uniform
+            let time_normalized = self.world.time_of_day as f32 / 24000.0;
+            let camera_uniform = self.camera.build_uniform(time_normalized);
+            pipeline.update_camera(renderer.queue(), &camera_uniform);
+
+            // Hand uniform: rendered in view-space (fixed to screen)
+            let hand_model = self.hand.model_matrix();
+            // Hand uses simple orthographic-like projection for screen-space
+            let hand_view_proj = glam::Mat4::perspective_rh(
+                70.0_f32.to_radians(),
+                self.camera.aspect,
+                0.01,
+                10.0,
+            );
+            let hand_uniform = crate::hand::HandUniform {
+                model: hand_model.to_cols_array(),
+                view_proj: hand_view_proj.to_cols_array(),
+            };
+            pipeline.update_hand(renderer.queue(), &hand_uniform);
         }
     }
 }
@@ -157,14 +336,37 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if let Some(egui_state) = &mut self.egui_state {
-            let response = egui_state.on_window_event(self.window.as_ref().unwrap(), &event);
-            if response.consumed {
-                return;
+        // In playing mode, don't let egui consume mouse events (camera needs them)
+        let egui_wants = if self.ui.screen == AppScreen::Playing {
+            // Only pass keyboard events to egui when playing
+            if matches!(event, WindowEvent::KeyboardInput { .. }) {
+                if let Some(egui_state) = &mut self.egui_state {
+                    let response = egui_state.on_window_event(self.window.as_ref().unwrap(), &event);
+                    response.consumed
+                } else {
+                    false
+                }
+            } else if matches!(event, WindowEvent::Resized(_) | WindowEvent::CloseRequested | WindowEvent::RedrawRequested) {
+                false
+            } else {
+                // Pass mouse to egui for HUD interaction, but also to input
+                if let Some(egui_state) = &mut self.egui_state {
+                    egui_state.on_window_event(self.window.as_ref().unwrap(), &event);
+                }
+                false // don't consume, input needs it too
             }
-        }
+        } else {
+            if let Some(egui_state) = &mut self.egui_state {
+                let response = egui_state.on_window_event(self.window.as_ref().unwrap(), &event);
+                response.consumed
+            } else {
+                false
+            }
+        };
 
-        self.input.handle_event(&event);
+        if !egui_wants {
+            self.input.handle_event(&event);
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -175,6 +377,12 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size);
                 }
+                if let Some(pipeline) = &mut self.game_pipeline {
+                    if let Some(renderer) = &self.renderer {
+                        pipeline.resize_depth(renderer.device(), new_size.width, new_size.height);
+                    }
+                }
+                self.camera.set_aspect(new_size.width, new_size.height);
             }
             WindowEvent::RedrawRequested => {
                 self.do_frame();
@@ -189,35 +397,57 @@ impl ApplicationHandler for App {
 
 impl App {
     fn do_frame(&mut self) {
-        let Some(window) = &self.window else { return };
-        let Some(egui_state) = &mut self.egui_state else { return };
-        let Some(renderer) = &mut self.renderer else { return };
-        let Some(egui_renderer) = &mut self.egui_renderer else { return };
+        if self.window.is_none() || self.renderer.is_none()
+            || self.egui_state.is_none() || self.egui_renderer.is_none() {
+            return;
+        }
 
-        // Drain network packets into world (if connected)
+        // Frame timing
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f32();
+        self.last_frame_time = now;
+
+        // ── Phase 1: Game update (no egui borrows) ──────────────────────
+
+        // Drain network packets
         if let Some(ref net) = self.net {
             for packet in net.drain_packets() {
                 self.world.handle_server_packet(packet);
             }
         }
 
-        // Begin egui frame
+        // Init rendering, mesh chunks, update game
+        if self.ui.screen == AppScreen::Playing {
+            self.init_game_rendering();
+            self.mesh_new_chunks();
+            self.update_game(dt);
+        }
+
+        // ── Phase 2: egui frame ─────────────────────────────────────────
+
+        let window = self.window.as_ref().unwrap();
+        let egui_state = self.egui_state.as_mut().unwrap();
+
         let raw_input = egui_state.take_egui_input(window);
         self.egui_ctx.begin_pass(raw_input);
 
-        // Draw UI -- only reads/writes ui state, returns deferred action
         let action = draw_ui(&self.egui_ctx, &mut self.ui, &self.world);
 
-        // End egui frame
         let full_output = self.egui_ctx.end_pass();
 
+        let egui_state = self.egui_state.as_mut().unwrap();
+        let window = self.window.as_ref().unwrap();
         egui_state.handle_platform_output(window, full_output.platform_output);
 
         let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        let renderer = self.renderer.as_mut().unwrap();
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [renderer.size().width, renderer.size().height],
             pixels_per_point: full_output.pixels_per_point,
         };
+
+        let egui_renderer = self.egui_renderer.as_mut().unwrap();
 
         for (id, delta) in &full_output.textures_delta.set {
             egui_renderer.update_texture(renderer.device(), renderer.queue(), *id, delta);
@@ -233,11 +463,20 @@ impl App {
         );
         renderer.queue().submit(std::iter::once(encoder.finish()));
 
-        // Render
-        match renderer.render_with_egui(egui_renderer, &paint_jobs, &screen_descriptor, &self.ui.screen) {
+        // ── Phase 3: Render ─────────────────────────────────────────────
+
+        let screen = self.ui.screen.clone();
+        match renderer.render_frame(
+            self.game_pipeline.as_ref(),
+            egui_renderer,
+            &paint_jobs,
+            &screen_descriptor,
+            &screen,
+        ) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
-                renderer.resize(window.inner_size());
+                let size = self.window.as_ref().unwrap().inner_size();
+                self.renderer.as_mut().unwrap().resize(size);
             }
             Err(wgpu::SurfaceError::OutOfMemory) => {
                 warn!("Out of GPU memory");
@@ -248,10 +487,13 @@ impl App {
         }
 
         for id in &full_output.textures_delta.free {
-            egui_renderer.free_texture(id);
+            self.egui_renderer.as_mut().unwrap().free_texture(id);
         }
 
-        // Execute deferred action (after egui frame is done)
+        // Clear per-frame input
+        self.input.begin_frame();
+
+        // Execute deferred action
         self.execute_action(action);
     }
 
@@ -290,9 +532,7 @@ impl App {
                         self.ui.status_message = msg;
                         self.ui.login_step = LoginStep::EnterCode;
                     }
-                    Err(e) => {
-                        self.ui.status_message = e;
-                    }
+                    Err(e) => { self.ui.status_message = e; }
                 }
             }
             UiAction::VerifyCode => {
@@ -314,9 +554,7 @@ impl App {
                         self.ui.screen = AppScreen::Connecting;
                         self.try_connect();
                     }
-                    Err(e) => {
-                        self.ui.status_message = e;
-                    }
+                    Err(e) => { self.ui.status_message = e; }
                 }
             }
             UiAction::Connect => {
@@ -355,14 +593,17 @@ impl App {
                 self.ui.nickname = login_success.nickname;
                 self.ui.status_message.clear();
                 self.ui.screen = AppScreen::Playing;
-
-                // Store the bridge -- keeps connection alive, packets flow in background
                 self.net = Some(bridge);
+
+                // Reset game state for new connection
+                self.world = ClientWorld::new();
+                self.meshed_chunks.clear();
+                self.atlas = None;
+                self.game_pipeline = None;
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("Connection failed: {}", err_msg);
-
                 if err_msg.contains("Invalid session") || err_msg.contains("401") {
                     session::delete_session();
                     self.ui.saved_token = None;
@@ -377,7 +618,7 @@ impl App {
     }
 }
 
-// ─── UI Drawing (pure functions, no &mut self) ──────────────────────────────
+// ─── UI Drawing ─────────────────────────────────────────────────────────────
 
 fn draw_ui(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld) -> UiAction {
     match ui.screen {
@@ -390,164 +631,118 @@ fn draw_ui(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld) -> UiActi
 
 fn draw_main_menu(ctx: &egui::Context, ui: &mut UiState) -> UiAction {
     let mut action = UiAction::None;
-
-    egui::CentralPanel::default().show(ctx, |panel| {
-        panel.vertical_centered(|panel| {
-            panel.add_space(100.0);
-            panel.heading(egui::RichText::new("SKY CRAFT").size(48.0).strong());
-            panel.add_space(40.0);
-
-            panel.label("Server address:");
-            panel.add_space(4.0);
-            panel.add(
-                egui::TextEdit::singleline(&mut ui.server_address)
-                    .hint_text("ip or ip:port")
-                    .desired_width(300.0),
-            );
-            panel.add_space(16.0);
-
-            if panel.add_sized([200.0, 40.0], egui::Button::new("Connect")).clicked() {
+    egui::CentralPanel::default().show(ctx, |p| {
+        p.vertical_centered(|p| {
+            p.add_space(100.0);
+            p.heading(egui::RichText::new("SKY CRAFT").size(48.0).strong());
+            p.add_space(40.0);
+            p.label("Server address:");
+            p.add_space(4.0);
+            p.add(egui::TextEdit::singleline(&mut ui.server_address)
+                .hint_text("ip or ip:port").desired_width(300.0));
+            p.add_space(16.0);
+            if p.add_sized([200.0, 40.0], egui::Button::new("Connect")).clicked() {
                 action = UiAction::Connect;
             }
-
-            panel.add_space(8.0);
-            if panel.add_sized([200.0, 30.0], egui::Button::new("Quit")).clicked() {
+            p.add_space(8.0);
+            if p.add_sized([200.0, 30.0], egui::Button::new("Quit")).clicked() {
                 action = UiAction::Quit;
             }
-
             if !ui.status_message.is_empty() {
-                panel.add_space(20.0);
-                panel.colored_label(egui::Color32::YELLOW, &ui.status_message);
+                p.add_space(20.0);
+                p.colored_label(egui::Color32::YELLOW, &ui.status_message);
             }
-
             if ui.saved_token.is_some() {
-                panel.add_space(20.0);
-                panel.colored_label(egui::Color32::GREEN, format!("Logged in as: {}", ui.nickname));
-                if panel.small_button("Logout").clicked() {
-                    action = UiAction::Logout;
-                }
+                p.add_space(20.0);
+                p.colored_label(egui::Color32::GREEN, format!("Logged in as: {}", ui.nickname));
+                if p.small_button("Logout").clicked() { action = UiAction::Logout; }
             }
-
-            panel.add_space(40.0);
-            panel.colored_label(egui::Color32::DARK_GRAY, format!("v{}", env!("CARGO_PKG_VERSION")));
+            p.add_space(40.0);
+            p.colored_label(egui::Color32::DARK_GRAY, format!("v{}", env!("CARGO_PKG_VERSION")));
         });
     });
-
     action
 }
 
 fn draw_login(ctx: &egui::Context, ui: &mut UiState) -> UiAction {
     let mut action = UiAction::None;
-
-    egui::CentralPanel::default().show(ctx, |panel| {
-        panel.vertical_centered(|panel| {
-            panel.add_space(100.0);
-            panel.heading(egui::RichText::new("Login").size(36.0));
-            panel.add_space(8.0);
-            panel.label("Register via Telegram bot: @skycraftauth_bot");
-            panel.add_space(30.0);
-
+    egui::CentralPanel::default().show(ctx, |p| {
+        p.vertical_centered(|p| {
+            p.add_space(100.0);
+            p.heading(egui::RichText::new("Login").size(36.0));
+            p.add_space(8.0);
+            p.label("Register via Telegram bot: @skycraftauth_bot");
+            p.add_space(30.0);
             match ui.login_step {
                 LoginStep::EnterNickname => {
-                    panel.label("Nickname:");
-                    panel.add_space(4.0);
-                    panel.add(
-                        egui::TextEdit::singleline(&mut ui.nickname)
-                            .hint_text("your nickname")
-                            .desired_width(300.0),
-                    );
-                    panel.add_space(16.0);
-
-                    if panel.add_sized([200.0, 40.0], egui::Button::new("Request Code")).clicked() {
+                    p.label("Nickname:");
+                    p.add_space(4.0);
+                    p.add(egui::TextEdit::singleline(&mut ui.nickname)
+                        .hint_text("your nickname").desired_width(300.0));
+                    p.add_space(16.0);
+                    if p.add_sized([200.0, 40.0], egui::Button::new("Request Code")).clicked() {
                         action = UiAction::RequestCode;
                     }
                 }
                 LoginStep::EnterCode => {
-                    panel.label(format!("Code sent to Telegram for: {}", ui.nickname));
-                    panel.add_space(12.0);
-                    panel.label("Enter 6-digit code:");
-                    panel.add_space(4.0);
-                    panel.add(
-                        egui::TextEdit::singleline(&mut ui.auth_code)
-                            .hint_text("000000")
-                            .desired_width(200.0),
-                    );
-                    panel.add_space(16.0);
-
-                    if panel.add_sized([200.0, 40.0], egui::Button::new("Verify")).clicked() {
+                    p.label(format!("Code sent to Telegram for: {}", ui.nickname));
+                    p.add_space(12.0);
+                    p.label("Enter 6-digit code:");
+                    p.add_space(4.0);
+                    p.add(egui::TextEdit::singleline(&mut ui.auth_code)
+                        .hint_text("000000").desired_width(200.0));
+                    p.add_space(16.0);
+                    if p.add_sized([200.0, 40.0], egui::Button::new("Verify")).clicked() {
                         action = UiAction::VerifyCode;
                     }
-
-                    if panel.small_button("Back").clicked() {
-                        action = UiAction::LoginBackToNickname;
-                    }
+                    if p.small_button("Back").clicked() { action = UiAction::LoginBackToNickname; }
                 }
             }
-
             if !ui.status_message.is_empty() {
-                panel.add_space(20.0);
-                panel.colored_label(egui::Color32::YELLOW, &ui.status_message);
+                p.add_space(20.0);
+                p.colored_label(egui::Color32::YELLOW, &ui.status_message);
             }
-
-            panel.add_space(20.0);
-            if panel.small_button("Back to menu").clicked() {
-                action = UiAction::GoToMainMenu;
-            }
+            p.add_space(20.0);
+            if p.small_button("Back to menu").clicked() { action = UiAction::GoToMainMenu; }
         });
     });
-
     action
 }
 
 fn draw_connecting(ctx: &egui::Context, ui: &mut UiState) -> UiAction {
     let mut action = UiAction::None;
-
-    egui::CentralPanel::default().show(ctx, |panel| {
-        panel.vertical_centered(|panel| {
-            panel.add_space(200.0);
-            panel.heading("Connecting...");
-            panel.add_space(16.0);
-            panel.spinner();
-            panel.add_space(16.0);
-
+    egui::CentralPanel::default().show(ctx, |p| {
+        p.vertical_centered(|p| {
+            p.add_space(200.0);
+            p.heading("Connecting...");
+            p.add_space(16.0);
+            p.spinner();
+            p.add_space(16.0);
             if !ui.status_message.is_empty() {
-                panel.colored_label(egui::Color32::YELLOW, &ui.status_message);
+                p.colored_label(egui::Color32::YELLOW, &ui.status_message);
             }
-
-            panel.add_space(20.0);
-            if panel.button("Cancel").clicked() {
-                action = UiAction::GoToMainMenu;
-            }
+            p.add_space(20.0);
+            if p.button("Cancel").clicked() { action = UiAction::GoToMainMenu; }
         });
     });
-
     action
 }
 
 fn draw_playing(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld) -> UiAction {
-    egui::TopBottomPanel::top("top_hud").show(ctx, |panel| {
-        panel.horizontal(|panel| {
-            panel.label(egui::RichText::new("Sky Craft").strong());
-            panel.separator();
-            panel.label(format!("Player: {}", ui.nickname));
-            panel.separator();
-            panel.label(format!(
-                "Chunks: {} | HP: {:.0} | Food: {}",
-                world.loaded_chunk_count(),
-                world.player.health,
-                world.player.food,
-            ));
-            panel.separator();
-            panel.label(format!(
-                "Pos: {:.1} {:.1} {:.1}",
-                world.player.position.x,
-                world.player.position.y,
-                world.player.position.z,
-            ));
-            panel.separator();
-            panel.label(format!("Ring: {}", world.current_ring));
+    egui::TopBottomPanel::top("top_hud").show(ctx, |p| {
+        p.horizontal(|p| {
+            p.label(egui::RichText::new("Sky Craft").strong());
+            p.separator();
+            p.label(format!("Player: {}", ui.nickname));
+            p.separator();
+            p.label(format!("Chunks: {} | HP: {:.0} | Food: {}",
+                world.loaded_chunk_count(), world.player.health, world.player.food));
+            p.separator();
+            p.label(format!("Pos: {:.1} {:.1} {:.1}",
+                world.player.position.x, world.player.position.y, world.player.position.z));
+            p.separator();
+            p.label(format!("Ring: {}", world.current_ring));
         });
     });
-
     UiAction::None
 }

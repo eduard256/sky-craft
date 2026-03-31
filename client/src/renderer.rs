@@ -1,4 +1,5 @@
-// wgpu renderer. Handles GPU init, surface, and frame rendering with egui overlay.
+// wgpu renderer. Handles GPU init, surface, and full frame rendering:
+// world blocks + hand overlay + egui UI.
 
 use std::sync::Arc;
 use wgpu::*;
@@ -6,6 +7,7 @@ use winit::window::Window;
 use tracing::info;
 
 use crate::state::AppScreen;
+use crate::pipeline::RenderPipeline;
 
 pub struct Renderer {
     device: Device,
@@ -89,13 +91,14 @@ impl Renderer {
 
     pub fn create_encoder(&mut self) -> CommandEncoder {
         self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("egui_encoder"),
+            label: Some("frame_encoder"),
         })
     }
 
-    /// Render frame with egui overlay.
-    pub fn render_with_egui(
+    /// Render full frame: world + hand + egui overlay.
+    pub fn render_frame(
         &mut self,
+        game_pipeline: Option<&RenderPipeline>,
         egui_renderer: &mut egui_wgpu::Renderer,
         paint_jobs: &[egui::ClippedPrimitive],
         screen_descriptor: &egui_wgpu::ScreenDescriptor,
@@ -113,13 +116,14 @@ impl Renderer {
             }
         };
 
-        // Clear pass
+        // ── Pass 1: World + Hand ────────────────────────────────────────
         let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("clear_encoder"),
+            label: Some("world_encoder"),
         });
+
         {
-            let _render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("main_pass"),
+            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("world_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -128,15 +132,45 @@ impl Renderer {
                         store: StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: game_pipeline.map(|p| {
+                    RenderPassDepthStencilAttachment {
+                        view: &p.depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Clear(1.0),
+                            store: StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // TODO: draw voxel world here
+
+            if let Some(pipeline) = game_pipeline {
+                // Draw world chunks
+                render_pass.set_pipeline(&pipeline.world_pipeline);
+                render_pass.set_bind_group(0, &pipeline.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &pipeline.atlas_bind_group, &[]);
+
+                for chunk_mesh in pipeline.chunk_meshes.values() {
+                    render_pass.set_vertex_buffer(0, chunk_mesh.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(chunk_mesh.index_buffer.slice(..), IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
+                }
+
+                // Draw hand (on top, depth always passes)
+                render_pass.set_pipeline(&pipeline.hand_pipeline);
+                render_pass.set_bind_group(0, &pipeline.hand_bind_group, &[]);
+                render_pass.set_bind_group(1, &pipeline.skin_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, pipeline.hand_vertex_buffer.slice(..));
+                render_pass.set_index_buffer(pipeline.hand_index_buffer.slice(..), IndexFormat::Uint32);
+                render_pass.draw_indexed(0..pipeline.hand_index_count, 0, 0..1);
+            }
         }
+
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // egui pass
+        // ── Pass 2: egui overlay ────────────────────────────────────────
         let mut encoder2 = self.device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("egui_encoder"),
         });
@@ -154,14 +188,12 @@ impl Renderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        // SAFETY: render_pass is dropped before encoder2.finish() via forget_lifetime
         let mut render_pass: wgpu::RenderPass<'static> = render_pass.forget_lifetime();
         egui_renderer.render(&mut render_pass, paint_jobs, screen_descriptor);
         drop(render_pass);
         self.queue.submit(std::iter::once(encoder2.finish()));
 
         output.present();
-
         Ok(())
     }
 }

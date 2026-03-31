@@ -84,6 +84,16 @@ impl ClientWorld {
         self.chunks.contains_key(pos)
     }
 
+    /// Get a chunk section by position.
+    pub fn get_chunk(&self, pos: &ChunkPos) -> Option<ChunkSection> {
+        self.chunks.get(pos).cloned()
+    }
+
+    /// Iterator over all loaded chunk positions.
+    pub fn loaded_chunk_positions(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.chunks.keys().copied()
+    }
+
     /// Number of loaded chunks.
     pub fn loaded_chunk_count(&self) -> usize {
         self.chunks.len()
