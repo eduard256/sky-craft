@@ -9,6 +9,8 @@ mod input;
 mod ui;
 mod audio;
 mod state;
+mod session;
+mod auth_client;
 
 use tracing::info;
 use winit::event_loop::EventLoop;

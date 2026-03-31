@@ -1,14 +1,11 @@
-// wgpu renderer. Handles GPU init, surface, render pipeline, and frame rendering.
-// In v0.0.1: clears screen with sky color. Real voxel rendering is TODO.
+// wgpu renderer. Handles GPU init, surface, and frame rendering with egui overlay.
 
 use std::sync::Arc;
 use wgpu::*;
 use winit::window::Window;
 use tracing::info;
 
-use crate::world::ClientWorld;
-use crate::input::InputState;
-use crate::state::AppState;
+use crate::state::AppScreen;
 
 pub struct Renderer {
     device: Device,
@@ -19,7 +16,6 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Initialize wgpu with the given window.
     pub async fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
         let size = window.inner_size();
 
@@ -77,7 +73,6 @@ impl Renderer {
         })
     }
 
-    /// Handle window resize.
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
@@ -87,27 +82,41 @@ impl Renderer {
         }
     }
 
-    /// Render a frame. Currently just clears to sky color.
-    pub fn render(
+    pub fn device(&self) -> &Device { &self.device }
+    pub fn queue(&self) -> &Queue { &self.queue }
+    pub fn size(&self) -> winit::dpi::PhysicalSize<u32> { self.size }
+    pub fn surface_format(&self) -> TextureFormat { self.surface_config.format }
+
+    pub fn create_encoder(&mut self) -> CommandEncoder {
+        self.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("egui_encoder"),
+        })
+    }
+
+    /// Render frame with egui overlay.
+    pub fn render_with_egui(
         &mut self,
-        _world: &ClientWorld,
-        _input: &InputState,
-        app_state: &AppState,
+        egui_renderer: &mut egui_wgpu::Renderer,
+        paint_jobs: &[egui::ClippedPrimitive],
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        app_state: &AppScreen,
     ) -> Result<(), SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());
 
-        // Sky color based on app state
         let clear_color = match app_state {
-            AppState::MainMenu => Color { r: 0.05, g: 0.05, b: 0.1, a: 1.0 },
-            AppState::Playing => Color { r: 0.45, g: 0.65, b: 0.92, a: 1.0 }, // sky blue
-            _ => Color { r: 0.1, g: 0.1, b: 0.15, a: 1.0 },
+            AppScreen::MainMenu | AppScreen::Login | AppScreen::Connecting => {
+                Color { r: 0.05, g: 0.05, b: 0.12, a: 1.0 }
+            }
+            AppScreen::Playing => {
+                Color { r: 0.45, g: 0.65, b: 0.92, a: 1.0 }
+            }
         };
 
+        // Clear pass
         let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("frame_encoder"),
+            label: Some("clear_encoder"),
         });
-
         {
             let _render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -123,15 +132,34 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-
-            // TODO: draw voxel meshes
-            // TODO: draw entities
-            // TODO: draw HUD/UI overlay
-            // TODO: draw particles
-            // TODO: draw sky/clouds
+            // TODO: draw voxel world here
         }
-
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        // egui pass
+        let mut encoder2 = self.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("egui_encoder"),
+        });
+        let render_pass = encoder2.begin_render_pass(&RenderPassDescriptor {
+            label: Some("egui_pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        // SAFETY: render_pass is dropped before encoder2.finish() via forget_lifetime
+        let mut render_pass: wgpu::RenderPass<'static> = render_pass.forget_lifetime();
+        egui_renderer.render(&mut render_pass, paint_jobs, screen_descriptor);
+        drop(render_pass);
+        self.queue.submit(std::iter::once(encoder2.finish()));
+
         output.present();
 
         Ok(())
