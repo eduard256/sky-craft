@@ -553,6 +553,29 @@ impl App {
             };
             pipeline.update_hand(renderer.queue(), &hand_uniform);
         }
+
+        // Rebuild mob meshes (upload per-entity cow geometry each frame)
+        if let (Some(pipeline), Some(renderer)) = (&mut self.game_pipeline, &self.renderer) {
+            // Remove meshes for entities that are no longer present
+            let entity_ids: Vec<_> = pipeline.mob_meshes.keys().copied().collect();
+            for eid in entity_ids {
+                if !self.world.entities.contains_key(&eid) {
+                    pipeline.remove_mob_mesh(eid);
+                }
+            }
+            // Build/update mesh for each entity (type 11 = cow)
+            for (eid, entity) in &self.world.entities {
+                if entity.entity_type != 11 { continue; }
+                let pos = glam::Vec3::new(
+                    entity.position.x as f32,
+                    entity.position.y as f32,
+                    entity.position.z as f32,
+                );
+                let yaw = entity.rotation.yaw.to_radians();
+                let (verts, idxs) = crate::cow::build_cow_mesh(pos, yaw);
+                pipeline.upload_mob_mesh(renderer.device(), *eid, &verts, &idxs);
+            }
+        }
     }
 
     /// Drain all pending download progress messages and update download_ui accordingly.

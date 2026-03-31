@@ -11,7 +11,7 @@ pub struct ClientWorld {
     /// Loaded chunk sections indexed by chunk position.
     chunks: HashMap<ChunkPos, ChunkSection>,
     /// Known entities (mobs, items, other players).
-    entities: HashMap<EntityId, ClientEntity>,
+    pub entities: HashMap<EntityId, ClientEntity>,
     /// Local player state (from server updates).
     pub player: LocalPlayer,
     /// Current weather.

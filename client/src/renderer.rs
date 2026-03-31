@@ -158,6 +158,16 @@ impl Renderer {
                     render_pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
                 }
 
+                // Draw mobs
+                render_pass.set_pipeline(&pipeline.mob_pipeline);
+                render_pass.set_bind_group(0, &pipeline.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &pipeline.cow_texture_bind_group, &[]);
+                for mob_mesh in pipeline.mob_meshes.values() {
+                    render_pass.set_vertex_buffer(0, mob_mesh.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(mob_mesh.index_buffer.slice(..), IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..mob_mesh.index_count, 0, 0..1);
+                }
+
                 // Draw hand (on top, depth always passes)
                 render_pass.set_pipeline(&pipeline.hand_pipeline);
                 render_pass.set_bind_group(0, &pipeline.hand_bind_group, &[]);

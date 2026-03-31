@@ -201,6 +201,12 @@ pub async fn handle_connection(
     });
     game_state.broadcast_packet(&spawn_packet, Some(entity_id));
 
+    // Send existing entities to new player
+    game_state.send_entities_to_player(entity_id);
+
+    // Spawn cows near spawn if first player (or always for now)
+    game_state.spawn_cows_near(spawn_pos);
+
     // ── Play Phase: main packet loop ──
     let result = play_loop(&mut send, &mut recv, entity_id, &game_state).await;
 

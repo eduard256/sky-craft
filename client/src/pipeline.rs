@@ -10,7 +10,7 @@ use crate::atlas::TextureAtlas;
 use crate::camera::CameraUniform;
 use crate::hand::HandUniform;
 use crate::mesh::{BlockVertex, ChunkMesh};
-use skycraft_protocol::types::ChunkPos;
+use skycraft_protocol::types::{ChunkPos, EntityId};
 
 /// GPU buffers for a single chunk mesh.
 pub struct ChunkGpuMesh {
@@ -42,6 +42,12 @@ pub struct RenderPipeline {
 
     // ── Chunk meshes on GPU ──
     pub chunk_meshes: HashMap<ChunkPos, ChunkGpuMesh>,
+
+    // ── Mob rendering ──
+    pub mob_pipeline: wgpu::RenderPipeline,
+    pub cow_texture_bind_group: BindGroup,
+    /// Per-entity dynamic GPU buffers (rebuilt each frame from CPU mesh).
+    pub mob_meshes: HashMap<EntityId, ChunkGpuMesh>,
 }
 
 impl RenderPipeline {
@@ -276,7 +282,64 @@ impl RenderPipeline {
             usage: BufferUsages::INDEX,
         });
 
-        info!("Render pipelines created (world + hand)");
+        // ── Mob pipeline (same as world pipeline but uses cow texture) ──
+        let mob_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("mob_pipeline"),
+            layout: Some(&world_pipeline_layout),
+            vertex: VertexState {
+                module: &world_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[BlockVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &world_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: surface_format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: CompareFunction::Less,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Load cow texture
+        let cow_texture_path = {
+            let dev = std::path::Path::new("client/assets/textures/entity/cow/cow.png");
+            if dev.exists() {
+                "client/assets/textures/entity/cow/cow.png".to_string()
+            } else if let Ok(exe) = std::env::current_exe() {
+                exe.parent().unwrap_or(std::path::Path::new("."))
+                    .join("assets/textures/entity/cow/cow.png")
+                    .to_string_lossy().to_string()
+            } else {
+                "assets/textures/entity/cow/cow.png".to_string()
+            }
+        };
+        let (cow_texture_bind_group, _cow_tex) = load_skin_texture(
+            device, queue, &texture_bind_group_layout, &cow_texture_path,
+        ).unwrap_or_else(|_| {
+            load_fallback_texture(device, queue, &texture_bind_group_layout)
+        });
+
+        info!("Render pipelines created (world + hand + mob)");
 
         Ok(Self {
             world_pipeline,
@@ -293,7 +356,37 @@ impl RenderPipeline {
             depth_texture,
             depth_view,
             chunk_meshes: HashMap::new(),
+            mob_pipeline,
+            cow_texture_bind_group,
+            mob_meshes: HashMap::new(),
         })
+    }
+
+    /// Upload a mob mesh to GPU (replaces previous).
+    pub fn upload_mob_mesh(&mut self, device: &Device, entity_id: EntityId, verts: &[BlockVertex], idxs: &[u32]) {
+        if verts.is_empty() {
+            self.mob_meshes.remove(&entity_id);
+            return;
+        }
+        let vertex_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("mob_verts"),
+            contents: bytemuck::cast_slice(verts),
+            usage: BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("mob_idxs"),
+            contents: bytemuck::cast_slice(idxs),
+            usage: BufferUsages::INDEX,
+        });
+        self.mob_meshes.insert(entity_id, ChunkGpuMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: idxs.len() as u32,
+        });
+    }
+
+    pub fn remove_mob_mesh(&mut self, entity_id: EntityId) {
+        self.mob_meshes.remove(&entity_id);
     }
 
     /// Upload a chunk mesh to GPU.
@@ -430,4 +523,49 @@ fn load_skin_texture(
     });
 
     Ok((bind_group, texture))
+}
+
+/// Create a 1x1 white fallback texture when a texture file is missing.
+fn load_fallback_texture(
+    device: &Device,
+    queue: &Queue,
+    layout: &BindGroupLayout,
+) -> (BindGroup, Texture) {
+    let size = Extent3d { width: 1, height: 1, depth_or_array_layers: 1 };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("fallback_texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        &[255u8, 192, 203, 255], // pink = clearly visible if texture missing
+        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+        size,
+    );
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&SamplerDescriptor {
+        mag_filter: FilterMode::Nearest,
+        min_filter: FilterMode::Nearest,
+        ..Default::default()
+    });
+    let bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("fallback_bg"),
+        layout,
+        entries: &[
+            BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&view) },
+            BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&sampler) },
+        ],
+    });
+    (bind_group, texture)
 }

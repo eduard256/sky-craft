@@ -11,7 +11,7 @@ use skycraft_protocol::MS_PER_TICK;
 use crate::config::ServerConfig;
 use crate::world::World;
 use crate::player::Player;
-use crate::entity::{Entity, EntityKind};
+use crate::entity::{Entity, EntityKind, AIState, MobCategory};
 use crate::physics;
 
 /// Central game state shared across all connection handlers and the game loop.
@@ -739,6 +739,76 @@ impl GameState {
             chat_type: ChatType::System,
         }));
     }
+
+    /// Spawn cows near a position if none exist in the area. Called when a player joins.
+    pub fn spawn_cows_near(&self, center: EntityPos) {
+        // Cow entity type ID from entities.json: cow = 11
+        const COW_ENTITY_TYPE: EntityTypeId = 11;
+        const NUM_COWS: usize = 5;
+        const SPAWN_RADIUS: f64 = 16.0;
+
+        for i in 0..NUM_COWS {
+            let angle = (i as f64) * std::f64::consts::TAU / NUM_COWS as f64;
+            let r = 6.0 + (i as f64) * 2.0;
+            let cx = center.x + angle.cos() * r;
+            let cz = center.z + angle.sin() * r;
+
+            // Find ground level
+            let ground_y = self.find_ground_y(cx, cz);
+            if ground_y < 0 { continue; }
+
+            let pos = EntityPos::new(cx, ground_y as f64 + 1.0, cz);
+            let id = self.next_entity_id.fetch_add(1, Ordering::Relaxed);
+            let mut entity = Entity::new_mob(id, COW_ENTITY_TYPE, pos, 10.0, 3.0, 1.0);
+
+            // Set as passive mob
+            if let EntityKind::Mob(ref mut mob) = entity.kind {
+                mob.mob_category = MobCategory::Passive;
+                mob.ai.wander_cooldown = (id % 40) as u32; // stagger wandering
+            }
+
+            let spawn_pkt = ServerPacket::SpawnEntity(S2CSpawnEntity {
+                entity_id: id,
+                entity_type: COW_ENTITY_TYPE,
+                position: pos,
+                rotation: Rotation { yaw: (i as f32) * 72.0, pitch: 0.0 },
+                velocity: Velocity { x: 0.0, y: 0.0, z: 0.0 },
+            });
+            self.broadcast_packet(&spawn_pkt, None);
+            self.entities.insert(id, RwLock::new(entity));
+        }
+    }
+
+    /// Find solid ground Y at given XZ. Returns -1 if not found.
+    fn find_ground_y(&self, x: f64, z: f64) -> i32 {
+        let bx = x.floor() as i32;
+        let bz = z.floor() as i32;
+        for y in (50..80).rev() {
+            let block = self.world.get_block(BlockPos::new(bx, y, bz));
+            let above = self.world.get_block(BlockPos::new(bx, y + 1, bz));
+            if block != 0 && above == 0 {
+                return y;
+            }
+        }
+        -1
+    }
+
+    /// Send all existing entities to a newly joined player.
+    pub fn send_entities_to_player(&self, entity_id: EntityId) {
+        for entry in self.entities.iter() {
+            if let Ok(entity) = entry.value().read() {
+                if entity.is_dead { continue; }
+                let pkt = ServerPacket::SpawnEntity(S2CSpawnEntity {
+                    entity_id: entity.id,
+                    entity_type: entity.entity_type,
+                    position: entity.position,
+                    rotation: entity.rotation,
+                    velocity: entity.velocity,
+                });
+                self.send_to_player(entity_id, pkt);
+            }
+        }
+    }
 }
 
 // ─── Game Loop ──────────────────────────────────────────────────────────────
@@ -941,10 +1011,14 @@ fn tick_players(state: &GameState, tick: u64) {
     }
 }
 
-fn tick_entities(state: &GameState, _tick: u64) {
+fn tick_entities(state: &GameState, tick: u64) {
     let entity_ids: Vec<EntityId> = state.entities.iter().map(|e| *e.key()).collect();
 
     for &eid in &entity_ids {
+        // Snapshot old position for delta movement packet
+        let old_pos = state.entities.get(&eid)
+            .and_then(|e| e.value().read().ok().map(|en| en.position));
+
         if let Some(entry) = state.entities.get(&eid) {
             if let Ok(mut entity) = entry.value().write() {
                 if entity.is_dead { continue; }
@@ -954,8 +1028,31 @@ fn tick_entities(state: &GameState, _tick: u64) {
                     entity.no_damage_ticks -= 1;
                 }
 
-                // Apply gravity
-                if !entity.on_ground {
+                // Gravity for mobs: keep them on ground
+                let is_mob = matches!(entity.kind, EntityKind::Mob(_));
+                if is_mob {
+                    // Check block below
+                    let below = BlockPos::new(
+                        entity.position.x.floor() as i32,
+                        (entity.position.y - 0.05) as i32,
+                        entity.position.z.floor() as i32,
+                    );
+                    let on_ground = state.world.get_block(below) != 0;
+                    entity.on_ground = on_ground;
+                    if !on_ground {
+                        entity.velocity.y -= 0.08; // gravity
+                        entity.velocity.y *= 0.98;
+                        entity.position.y += entity.velocity.y;
+                    } else {
+                        entity.velocity.y = 0.0;
+                        // Snap to ground
+                        let ground_y = below.y as f64 + 1.0;
+                        if entity.position.y < ground_y {
+                            entity.position.y = ground_y;
+                        }
+                    }
+                } else if !entity.on_ground {
+                    // Non-mob entities: full gravity
                     entity.velocity = physics::apply_gravity(entity.velocity, false);
                     entity.position.x += entity.velocity.x;
                     entity.position.y += entity.velocity.y;
@@ -987,13 +1084,143 @@ fn tick_entities(state: &GameState, _tick: u64) {
                 }
 
                 // Basic mob AI tick
-                if let EntityKind::Mob(ref mut mob) = entity.kind {
-                    mob.ticks_since_attack += 1;
-                    mob.despawn_timer += 1;
+                let is_passive_mob = matches!(&entity.kind, EntityKind::Mob(m) if m.mob_category == MobCategory::Passive);
+                {
+                    if let EntityKind::Mob(ref mut mob) = entity.kind {
+                        mob.ticks_since_attack += 1;
+                        mob.despawn_timer += 1;
+                        if mob.despawn_timer > 12000 {
+                            entity.is_dead = true;
+                        }
+                    }
+                }
 
-                    // Despawn if far from all players (simplified)
-                    if mob.despawn_timer > 12000 { // 10 min with no player nearby
-                        entity.is_dead = true;
+                // Passive mob wandering AI (separate borrow scope)
+                if is_passive_mob && !entity.is_dead {
+                    // Snapshot values needed for computation before borrowing mob
+                    let eid_f = entity.id as f64;
+                    let ex = entity.position.x;
+                    let ey = entity.position.y;
+                    let ez = entity.position.z;
+                    let eid_u = entity.id;
+
+                    if let EntityKind::Mob(ref mut mob) = entity.kind {
+                        if mob.ai.wander_cooldown > 0 {
+                            mob.ai.wander_cooldown -= 1;
+                        } else {
+                            match mob.ai.state {
+                                AIState::Idle => {
+                                    let angle = (eid_f * 2.399963 + ex * 0.1) % std::f64::consts::TAU;
+                                    let dist = 3.0 + (eid_f * 1.618) % 5.0;
+                                    mob.ai.wander_target = Some(BlockPos::new(
+                                        (ex + angle.cos() * dist) as i32,
+                                        ey as i32,
+                                        (ez + angle.sin() * dist) as i32,
+                                    ));
+                                    mob.ai.state = AIState::Wandering;
+                                    mob.ai.wander_cooldown = 20 + (eid_u % 20) as u32;
+                                }
+                                AIState::Wandering => {
+                                    if let Some(target) = mob.ai.wander_target {
+                                        let tx = target.x as f64 + 0.5;
+                                        let tz = target.z as f64 + 0.5;
+                                        let dx = tx - ex;
+                                        let dz = tz - ez;
+                                        let dist = (dx * dx + dz * dz).sqrt();
+                                        if dist < 0.5 {
+                                            mob.ai.state = AIState::Idle;
+                                            mob.ai.wander_cooldown = 40 + (eid_u % 60) as u32;
+                                            entity.velocity.x = 0.0;
+                                            entity.velocity.z = 0.0;
+                                        } else {
+                                            let speed = 0.08;
+                                            entity.velocity.x = dx / dist * speed;
+                                            entity.velocity.z = dz / dist * speed;
+                                            entity.rotation.yaw = (dz.atan2(dx) as f32).to_degrees();
+                                        }
+                                    } else {
+                                        mob.ai.state = AIState::Idle;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    // Move horizontally with AABB collision (same approach as player)
+                    // Cow hitbox: 0.45 half-width, 1.4 tall
+                    const COW_HW: f64 = 0.45;
+                    const COW_H: f64 = 1.4;
+
+                    let cow_blocked = |cx: f64, cy: f64, cz: f64| -> bool {
+                        let x0 = (cx - COW_HW).floor() as i32;
+                        let x1 = (cx + COW_HW).floor() as i32;
+                        let y0 = cy.floor() as i32;
+                        let y1 = (cy + COW_H - 0.01).floor() as i32;
+                        let z0 = (cz - COW_HW).floor() as i32;
+                        let z1 = (cz + COW_HW).floor() as i32;
+                        for bx in x0..=x1 {
+                            for by in y0..=y1 {
+                                for bz in z0..=z1 {
+                                    if state.world.get_block(BlockPos::new(bx, by, bz)) != 0 {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    };
+
+                    let cur_x = entity.position.x;
+                    let cur_y = entity.position.y;
+                    let cur_z = entity.position.z;
+                    let new_x = cur_x + entity.velocity.x;
+                    let new_z = cur_z + entity.velocity.z;
+
+                    let can_x = !cow_blocked(new_x, cur_y, cur_z);
+                    let can_z = !cow_blocked(if can_x { new_x } else { cur_x }, cur_y, new_z);
+
+                    if can_x {
+                        entity.position.x = new_x;
+                    } else {
+                        entity.velocity.x = 0.0;
+                        // Stuck — reset to idle so AI picks a new target
+                        if let EntityKind::Mob(ref mut mob) = entity.kind {
+                            mob.ai.state = AIState::Idle;
+                            mob.ai.wander_cooldown = 10;
+                        }
+                    }
+                    if can_z {
+                        entity.position.z = new_z;
+                    } else {
+                        entity.velocity.z = 0.0;
+                        if let EntityKind::Mob(ref mut mob) = entity.kind {
+                            mob.ai.state = AIState::Idle;
+                            mob.ai.wander_cooldown = 10;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Broadcast movement every 2 ticks for mobs (10 Hz)
+        if tick % 2 == 0 {
+            if let (Some(old), Some(entry)) = (old_pos, state.entities.get(&eid)) {
+                if let Ok(entity) = entry.value().read() {
+                    if !entity.is_dead {
+                        let dx = ((entity.position.x - old.x) * 4096.0) as i16;
+                        let dy = ((entity.position.y - old.y) * 4096.0) as i16;
+                        let dz = ((entity.position.z - old.z) * 4096.0) as i16;
+                        if dx != 0 || dy != 0 || dz != 0 {
+                            let pkt = ServerPacket::EntityMoveAndLook(S2CEntityMoveAndLook {
+                                entity_id: eid,
+                                dx, dy, dz,
+                                yaw: entity.rotation.yaw,
+                                pitch: entity.rotation.pitch,
+                                on_ground: entity.on_ground,
+                            });
+                            state.broadcast_packet(&pkt, None);
+                        }
                     }
                 }
             }

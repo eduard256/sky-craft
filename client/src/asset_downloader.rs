@@ -122,9 +122,9 @@ fn download_assets_inner(tx: &Sender<DownloadProgress>) -> Result<(), Box<dyn st
                     return false;
                 }
                 let rel = &name[ZIP_ASSETS_PREFIX.len()..];
-                // block textures OR entity/steve.png
+                // block textures OR entity textures (all mobs)
                 (rel.starts_with("block/") && rel.ends_with(".png"))
-                    || rel == "entity/steve.png"
+                    || (rel.starts_with("entity/") && rel.ends_with(".png"))
             } else {
                 false
             }
