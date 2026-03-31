@@ -119,6 +119,9 @@ pub struct App {
     /// Chunks that need remesh (e.g. neighbor arrived).
     dirty_chunks: HashSet<ChunkPos>,
 
+    /// Whether inventory is open.
+    inventory_open: bool,
+
     /// Set to true if init_game_rendering failed so we don't spam retries every frame.
     rendering_init_failed: bool,
 
@@ -182,6 +185,7 @@ impl App {
             hand: Hand::new(),
             meshed_chunks: HashSet::new(),
             dirty_chunks: HashSet::new(),
+            inventory_open: false,
             rendering_init_failed: false,
             download_rx,
             download_ui,
@@ -341,8 +345,23 @@ impl App {
 
     /// Update camera and hand each frame.
     fn update_game(&mut self, dt: f32) {
-        // Mouse look (only when playing and not in menu)
-        if self.ui.screen == AppScreen::Playing {
+        // Toggle inventory
+        if self.input.is_inventory_pressed() {
+            self.inventory_open = !self.inventory_open;
+            if let Some(window) = &self.window {
+                if self.inventory_open {
+                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                } else {
+                    let _ = window.set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                    window.set_cursor_visible(false);
+                }
+            }
+        }
+
+        // Mouse look (only when playing and inventory closed)
+        if self.ui.screen == AppScreen::Playing && !self.inventory_open {
             self.camera.process_mouse(self.input.mouse_dx, self.input.mouse_dy);
         }
 
@@ -733,7 +752,7 @@ impl App {
         let raw_input = egui_state.take_egui_input(window);
         self.egui_ctx.begin_pass(raw_input);
 
-        let action = draw_ui(&self.egui_ctx, &mut self.ui, &self.world, &self.download_ui);
+        let action = draw_ui(&self.egui_ctx, &mut self.ui, &self.world, &self.download_ui, self.inventory_open, self.world.player.held_slot);
 
         let full_output = self.egui_ctx.end_pass();
 
@@ -935,12 +954,12 @@ impl App {
 
 // ─── UI Drawing ─────────────────────────────────────────────────────────────
 
-fn draw_ui(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld, dl: &AssetDownloadUi) -> UiAction {
+fn draw_ui(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld, dl: &AssetDownloadUi, inventory_open: bool, held_slot: u8) -> UiAction {
     let action = match ui.screen {
         AppScreen::MainMenu => draw_main_menu(ctx, ui),
         AppScreen::Login => draw_login(ctx, ui),
         AppScreen::Connecting => draw_connecting(ctx, ui),
-        AppScreen::Playing => draw_playing(ctx, ui, world),
+        AppScreen::Playing => draw_playing(ctx, ui, world, inventory_open, held_slot),
     };
 
     // Asset download modal: shown over any screen (typically MainMenu on first run).
@@ -1050,7 +1069,55 @@ fn draw_connecting(ctx: &egui::Context, ui: &mut UiState) -> UiAction {
     action
 }
 
-fn draw_playing(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld) -> UiAction {
+fn draw_slot(ui: &mut egui::Ui, slot: &skycraft_protocol::types::Slot, selected: bool) {
+    let size = egui::vec2(40.0, 40.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+
+    let bg = if selected { egui::Color32::from_rgb(180, 180, 60) } else { egui::Color32::from_rgba_unmultiplied(40, 40, 40, 200) };
+    painter.rect_filled(rect, 3.0, bg);
+    painter.rect_stroke(rect, 3.0, (1.0, egui::Color32::from_gray(120)), egui::StrokeKind::Outside);
+
+    if let Some(item) = slot {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{}", item.item_id),
+            egui::FontId::monospace(10.0),
+            egui::Color32::WHITE,
+        );
+        if item.count > 1 {
+            painter.text(
+                rect.right_bottom() - egui::vec2(2.0, 2.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("{}", item.count),
+                egui::FontId::monospace(9.0),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+}
+
+fn draw_playing(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld, inventory_open: bool, held_slot: u8) -> UiAction {
+    // Crosshair
+    egui::Area::new(egui::Id::new("crosshair"))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .interactable(false)
+        .show(ctx, |ui| {
+            let painter = ui.painter();
+            let center = painter.clip_rect().center();
+            let size = 10.0;
+            let thickness = 2.0;
+            let color = egui::Color32::WHITE;
+            let shadow = egui::Color32::from_black_alpha(180);
+            // Shadow
+            painter.line_segment([egui::pos2(center.x - size + 1.0, center.y + 1.0), egui::pos2(center.x + size + 1.0, center.y + 1.0)], (thickness, shadow));
+            painter.line_segment([egui::pos2(center.x + 1.0, center.y - size + 1.0), egui::pos2(center.x + 1.0, center.y + size + 1.0)], (thickness, shadow));
+            // Cross
+            painter.line_segment([egui::pos2(center.x - size, center.y), egui::pos2(center.x + size, center.y)], (thickness, color));
+            painter.line_segment([egui::pos2(center.x, center.y - size), egui::pos2(center.x, center.y + size)], (thickness, color));
+        });
+
     egui::TopBottomPanel::top("top_hud").show(ctx, |p| {
         p.horizontal(|p| {
             p.label(egui::RichText::new("Sky Craft").strong());
@@ -1066,6 +1133,53 @@ fn draw_playing(ctx: &egui::Context, ui: &mut UiState, world: &ClientWorld) -> U
             p.label(format!("Ring: {}", world.current_ring));
         });
     });
+
+    // Hotbar (bottom center, 9 slots)
+    egui::Area::new(egui::Id::new("hotbar"))
+        .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -8.0])
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                for i in 0..9usize {
+                    let slot = world.player.inventory.get(i + 36).cloned().flatten();
+                    draw_slot(ui, &slot, i as u8 == held_slot);
+                }
+            });
+        });
+
+    // Full inventory (E key)
+    if inventory_open {
+        egui::Window::new("Inventory")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Inventory");
+                ui.separator();
+                // Main inventory: slots 0-35 (4 rows x 9)
+                for row in 0..4usize {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                        for col in 0..9usize {
+                            let idx = row * 9 + col;
+                            let slot = world.player.inventory.get(idx).cloned().flatten();
+                            draw_slot(ui, &slot, false);
+                        }
+                    });
+                }
+                ui.separator();
+                // Hotbar: slots 36-44
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    for i in 0..9usize {
+                        let slot = world.player.inventory.get(i + 36).cloned().flatten();
+                        draw_slot(ui, &slot, i as u8 == held_slot);
+                    }
+                });
+            });
+    }
+
     UiAction::None
 }
 
