@@ -3,9 +3,14 @@
 // and reports download/extraction progress via an mpsc channel.
 //
 // No git required — works on Windows, Mac, Linux.
+//
+// Asset layout on disk (relative to the executable):
+//   assets/textures/block/         <- block PNGs
+//   assets/textures/entity/        <- steve.png
+//   assets/textures/.downloaded    <- marker file
 
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 /// URL to the PixelPerfectionCE master branch ZIP (CC-BY-SA-4.0 license).
@@ -14,9 +19,6 @@ const TEXTURES_ZIP_URL: &str =
 
 /// Prefix inside the ZIP for all assets.
 const ZIP_ASSETS_PREFIX: &str = "PixelPerfectionCE-master/assets/minecraft/textures/";
-
-/// Marker file written after successful extraction. Prevents re-downloading on next run.
-const MARKER_SUBPATH: &str = "client/assets/textures/.downloaded";
 
 /// Progress messages sent from the background download thread to the UI thread.
 #[derive(Debug)]
@@ -34,23 +36,46 @@ pub enum DownloadProgress {
     Error(String),
 }
 
-/// Returns true if the asset marker file exists, meaning assets are already present.
-/// `base_dir` is the repository root (the working directory when the client is launched).
-pub fn check_assets(base_dir: &str) -> bool {
-    Path::new(base_dir).join(MARKER_SUBPATH).exists()
+/// Returns the directory where assets should be stored.
+///
+/// In development (cargo run from repo root): `<repo>/client/assets/textures`
+/// In a release build: `<exe_dir>/assets/textures`
+///
+/// The heuristic: if `client/assets/textures` exists relative to CWD, use that
+/// (developer mode). Otherwise use a sibling `assets/textures` next to the exe.
+pub fn assets_dir() -> PathBuf {
+    let dev_path = Path::new("client/assets/textures");
+    if dev_path.exists() {
+        return dev_path.to_path_buf();
+    }
+    // Release / installed mode: place assets next to the executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("assets/textures");
+        }
+    }
+    // Last resort fallback.
+    PathBuf::from("assets/textures")
+}
+
+/// Returns true if assets are already present (marker file exists).
+pub fn check_assets() -> bool {
+    assets_dir().join(".downloaded").exists()
 }
 
 /// Downloads and extracts assets in a blocking fashion. Designed to run in `std::thread::spawn`.
 ///
 /// Sends `DownloadProgress` messages over `tx`. Always sends either `Done` or `Error` as the
 /// last message before returning, so the UI can stop polling.
-pub fn download_assets(base_dir: &str, tx: Sender<DownloadProgress>) {
-    if let Err(e) = download_assets_inner(base_dir, &tx) {
+pub fn download_assets(tx: Sender<DownloadProgress>) {
+    if let Err(e) = download_assets_inner(&tx) {
         let _ = tx.send(DownloadProgress::Error(e.to_string()));
     }
 }
 
-fn download_assets_inner(base_dir: &str, tx: &Sender<DownloadProgress>) -> Result<(), Box<dyn std::error::Error>> {
+fn download_assets_inner(tx: &Sender<DownloadProgress>) -> Result<(), Box<dyn std::error::Error>> {
+    let dest_textures = assets_dir();
+
     // ── Phase 1: Download ZIP ────────────────────────────────────────────────
 
     let client = reqwest::blocking::Client::builder()
@@ -110,22 +135,16 @@ fn download_assets_inner(base_dir: &str, tx: &Sender<DownloadProgress>) -> Resul
 
     // ── Phase 3: Extract ─────────────────────────────────────────────────────
 
-    let base = Path::new(base_dir);
-
     for (extracted, &idx) in relevant.iter().enumerate() {
         let mut file = archive.by_index(idx)?;
         let raw_name = file.name().to_string();
 
-        // Strip the ZIP prefix to get relative path inside our assets dir.
+        // Strip the ZIP prefix to get a path relative to our textures dir.
         // raw_name: "PixelPerfectionCE-master/assets/minecraft/textures/block/stone.png"
         // rel:      "block/stone.png"
         let rel = &raw_name[ZIP_ASSETS_PREFIX.len()..];
 
-        // Map to destination:
-        // "block/stone.png" -> "client/assets/textures/minecraft/textures/block/stone.png"
-        let dest = base
-            .join("client/assets/textures/minecraft/textures")
-            .join(rel);
+        let dest = dest_textures.join(rel);
 
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -142,11 +161,7 @@ fn download_assets_inner(base_dir: &str, tx: &Sender<DownloadProgress>) -> Resul
 
     // ── Phase 4: Write marker ────────────────────────────────────────────────
 
-    let marker = base.join(MARKER_SUBPATH);
-    if let Some(parent) = marker.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::File::create(&marker)?
+    std::fs::File::create(dest_textures.join(".downloaded"))?
         .write_all(b"downloaded")?;
 
     let _ = tx.send(DownloadProgress::Done);

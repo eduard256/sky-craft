@@ -130,7 +130,7 @@ impl App {
 
         // Check whether game assets exist. If not, start downloading immediately
         // so by the time the window appears the download is already in progress.
-        let (download_rx, download_ui) = if asset_downloader::check_assets(".") {
+        let (download_rx, download_ui) = if asset_downloader::check_assets() {
             (None, AssetDownloadUi {
                 show: false,
                 status: String::new(),
@@ -140,7 +140,7 @@ impl App {
         } else {
             info!("Game assets missing — starting download...");
             let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || asset_downloader::download_assets(".", tx));
+            std::thread::spawn(move || asset_downloader::download_assets(tx));
             (Some(rx), AssetDownloadUi {
                 show: true,
                 status: "Connecting to GitHub...".to_string(),
@@ -183,12 +183,27 @@ impl App {
         let Some(renderer) = &self.renderer else { return };
         if self.atlas.is_some() { return; } // already initialized
 
+        // Resolve asset paths. In dev mode (cargo run from repo root) these point into
+        // client/assets/textures; in release builds they point next to the exe.
+        let textures_dir = asset_downloader::assets_dir();
+        let block_textures = textures_dir.join("block");
+        let steve_skin = textures_dir.join("entity/steve.png");
+
+        // data dir: always relative to CWD in dev, or next to exe in release.
+        let data_dir = if std::path::Path::new("common/data").exists() {
+            std::path::PathBuf::from("common/data")
+        } else if let Ok(exe) = std::env::current_exe() {
+            exe.parent().unwrap_or(std::path::Path::new(".")).join("data")
+        } else {
+            std::path::PathBuf::from("data")
+        };
+
         info!("Building texture atlas...");
         let atlas = match TextureAtlas::build(
             renderer.device(),
             renderer.queue(),
-            "common/data",
-            "client/assets/textures/minecraft/textures/block",
+            data_dir.to_str().unwrap_or("common/data"),
+            block_textures.to_str().unwrap_or("client/assets/textures/minecraft/textures/block"),
         ) {
             Ok(a) => a,
             Err(e) => {
@@ -205,7 +220,7 @@ impl App {
             renderer.size().width,
             renderer.size().height,
             &atlas,
-            "client/assets/textures/minecraft/textures/entity/steve.png",
+            steve_skin.to_str().unwrap_or("client/assets/textures/minecraft/textures/entity/steve.png"),
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -876,7 +891,7 @@ fn draw_download_modal(ctx: &egui::Context, dl: &AssetDownloadUi) {
                     p.colored_label(egui::Color32::RED, &dl.status);
                     p.add_space(8.0);
                     p.label("Please run the game again to retry,");
-                    p.label("or run scripts/download_assets.sh manually.");
+                    p.label("Check your internet connection and restart the game.");
                 } else if dl.progress < 0.0 {
                     // Indeterminate — no Content-Length from server yet.
                     p.spinner();
