@@ -21,10 +21,12 @@ pub struct World {
 
 impl World {
     pub fn new(seed: i64, config: Arc<ServerConfig>) -> Self {
+        let mut generator = WorldGenerator::new(seed);
+        generator.flat = config.flat_world;
         Self {
             seed,
             chunks: ChunkStore::new(),
-            generator: WorldGenerator::new(seed),
+            generator,
             config,
         }
     }
@@ -66,6 +68,9 @@ impl World {
 
     /// Get the world spawn position (center of ring 0, on a suitable island).
     pub fn get_spawn_position(&self) -> EntityPos {
+        if self.config.flat_world {
+            return EntityPos::new(0.5, 65.0, 0.5);
+        }
         // Find the first solid block near origin
         // Search in a spiral from 0,0 outward for a valid spawn point
         for radius in 0i32..100 {

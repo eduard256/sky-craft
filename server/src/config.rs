@@ -45,6 +45,10 @@ pub struct ServerConfig {
     #[serde(default = "default_sleeping_percentage")]
     pub players_sleeping_percentage: u8,
 
+    // ── Debug ──
+    #[serde(default)]
+    pub flat_world: bool,
+
     // ── Auth ──
     #[serde(default = "default_auth_url")]
     pub auth_api_url: String,
@@ -116,6 +120,7 @@ impl Default for ServerConfig {
             players_sleeping_percentage: default_sleeping_percentage(),
             auth_api_url: default_auth_url(),
             world_dir: default_world_dir(),
+            flat_world: false,
         }
     }
 }

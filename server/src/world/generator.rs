@@ -61,15 +61,19 @@ pub mod blocks {
 /// World generator produces chunk sections from seed + position.
 pub struct WorldGenerator {
     seed: i64,
+    pub flat: bool,
 }
 
 impl WorldGenerator {
     pub fn new(seed: i64) -> Self {
-        Self { seed }
+        Self { seed, flat: false }
     }
 
     /// Generate a chunk section at the given chunk position.
     pub fn generate_chunk(&self, chunk_pos: ChunkPos) -> ChunkSection {
+        if self.flat {
+            return self.generate_flat_chunk(chunk_pos);
+        }
         // Find all islands that might intersect this chunk
         let nearby = island::islands_near_chunk(chunk_pos.x, chunk_pos.z, self.seed);
 
@@ -239,6 +243,25 @@ impl WorldGenerator {
         }
 
         None
+    }
+
+    /// Generate a flat world chunk: one layer of GRASS_BLOCK at Y=64.
+    fn generate_flat_chunk(&self, chunk_pos: ChunkPos) -> ChunkSection {
+        let base_y = chunk_pos.y * 16;
+        let mut section = ChunkSection::empty();
+
+        for ly in 0..16u8 {
+            let wy = base_y + ly as i32;
+            if wy == 64 {
+                for lz in 0..16u8 {
+                    for lx in 0..16u8 {
+                        set_block_in_section(&mut section, lx, ly, lz, blocks::GRASS_BLOCK);
+                    }
+                }
+            }
+        }
+
+        section
     }
 
     /// Try to place precious blocks (gold/diamond/emerald blocks) at high rings.

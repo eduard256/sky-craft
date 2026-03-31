@@ -229,22 +229,9 @@ fn greedy_merge(
                 continue;
             }
 
-            // Expand width (along u axis)
-            let mut width = 1usize;
-            while u + width < 16 && mask[v][u + width] == block {
-                width += 1;
-            }
-
-            // Expand height (along v axis)
-            let mut height = 1usize;
-            'outer: while v + height < 16 {
-                for wu in 0..width {
-                    if mask[v + height][u + wu] != block {
-                        break 'outer;
-                    }
-                }
-                height += 1;
-            }
+            // No greedy merging — one quad per block for correct UV tiling
+            let width = 1usize;
+            let height = 1usize;
 
             // Clear merged area from mask
             for hv in 0..height {
@@ -309,11 +296,12 @@ fn emit_quad(
         corner[v_axis] = cv + base[v_axis];
     }
 
-    // UV coordinates: tile the texture across the merged face
+    // UV coordinates: one tile per block (no stretching, no tiling across merged faces)
     let u0 = uv.u_min;
     let v0 = uv.v_min;
-    let u1 = uv.u_min + (uv.u_max - uv.u_min) * tex_scale_u;
-    let v1 = uv.v_min + (uv.v_max - uv.v_min) * tex_scale_v;
+    let u1 = uv.u_max;
+    let v1 = uv.v_max;
+    let _ = (tex_scale_u, tex_scale_v);
 
     let tex = [
         [u0, v0],
